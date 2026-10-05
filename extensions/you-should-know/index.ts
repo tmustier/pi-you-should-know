@@ -4,6 +4,7 @@
 // via turn_end's `context.llmMessages`), append the original detect prompt, and ask whether
 // there's something the user should know but probably missed. Most of the time the answer is
 // `learn: none`. When it isn't, show a note above the editor. Respond with /ysk (or alt+shift+y).
+// In fullscreen mode, click a note to open it under its line and answer it with buttons.
 //
 // Reference (extracted from the Claude Code binary): ~/.pi/agent/reference/you-should-know/
 //
@@ -12,13 +13,14 @@
 // explanation, for the client to show and answer itself. The client reports each answer back
 // with `/ysk answer <id> <action>`.
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync, appendFileSync, readdirSync, renameSync, unlinkSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync, appendFileSync, readdirSync, renameSync, unlinkSync, rmSync, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { basename, dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { basename, dirname, isAbsolute, join, resolve } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { DynamicBorder, getMarkdownTheme } from "@earendil-works/pi-coding-agent";
-import { Container, Markdown, matchesKey, Text } from "@earendil-works/pi-tui";
+import type { Component, TuiMouseEvent } from "@earendil-works/pi-tui";
+import { Container, Markdown, matchesKey, Text, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 
 // ---- constants copied from the CC mod ----
 const CHECK_EVERY_STEPS = 6; // var kr=6
@@ -27,6 +29,7 @@ const MAX_SKIP = 16; // var dt=16
 const FREE_IGNORES = 2; // var ut=2
 const HISTORY_MAX = 50; // var $t=50
 const MAX_NOTES = 5; // local: notes pile up until answered; oldest drops past this
+const UNDO_MS = 5000; // agent-default (not a user rule): 2026-10-05. How long "Dismissed · Undo" stays after a click.
 const backoff = (ignoredInARow: number) =>
 	ignoredInARow <= FREE_IGNORES ? 0 : Math.min(MAX_SKIP, 2 ** (ignoredInARow - FREE_IGNORES - 1)); // kn()
 
@@ -153,6 +156,104 @@ function parse(text: string): Parsed {
 }
 const norm = (s: string) => s.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim(); // Co()
 
+// ---- clickable buttons (fullscreen mouse) ----
+type Button<A extends string> = { label: string; action: A; dim?: boolean };
+type Hit<A extends string> = { x0: number; x1: number; action: A };
+/** Lays buttons out left to right after `indent` columns, wrapping when they do not fit, and records where each one landed. */
+function layoutButtons<A extends string>(buttons: Button<A>[], width: number, indent: number, theme: any) {
+	const lines: string[] = [];
+	const hits: Hit<A>[][] = [];
+	let line = " ".repeat(indent);
+	let x = indent;
+	let row: Hit<A>[] = [];
+	for (const b of buttons) {
+		const text = `[${b.label}]`;
+		const w = visibleWidth(text);
+		if (row.length > 0 && x + 2 + w > width) {
+			lines.push(truncateToWidth(line, width, ""));
+			hits.push(row);
+			line = " ".repeat(indent);
+			x = indent;
+			row = [];
+		}
+		if (row.length > 0) {
+			line += "  ";
+			x += 2;
+		}
+		row.push({ x0: x, x1: x + w, action: b.action });
+		line += theme.fg(b.dim ? "dim" : "accent", text);
+		x += w;
+	}
+	lines.push(truncateToWidth(line, width, ""));
+	hits.push(row);
+	return { lines, hits };
+}
+/** The button under a left click, if any. Presses and drags are left alone so text selection keeps working. */
+const clicked = <A extends string>(row: Hit<A>[] | undefined, e: TuiMouseEvent) =>
+	e.type === "click" && e.button === "left" ? row?.find((h) => e.x >= h.x0 && e.x < h.x1)?.action : undefined;
+class ButtonRow<A extends string> implements Component {
+	private hits: Hit<A>[][] = [];
+	private buttons: Button<A>[];
+	private theme: any;
+	private onPress: (action: A) => void;
+	constructor(buttons: Button<A>[], theme: any, onPress: (action: A) => void) {
+		this.buttons = buttons;
+		this.theme = theme;
+		this.onPress = onPress;
+	}
+	render(width: number) {
+		const laid = layoutButtons(this.buttons, width, 1, this.theme);
+		this.hits = laid.hits;
+		return laid.lines;
+	}
+	handleMouse(e: TuiMouseEvent) {
+		const action = clicked(this.hits[e.y], e);
+		if (!action) return undefined;
+		this.onPress(action);
+		return { handled: true };
+	}
+	invalidate() {}
+}
+
+/** Evidence that starts with an existing file (`src/a.ts:12 ...`) gets a terminal link to that file. */
+function linkEvidence(evidence: string, cwd: string) {
+	const m = /^([^\s,;()]+?)(:\d+(?:[:-]\d+)?)?(?=$|[\s,;)])/.exec(evidence);
+	if (!m) return evidence;
+	const path = m[1].replace(/^~(?=\/)/, homedir());
+	const file = isAbsolute(path) ? path : resolve(cwd, path);
+	try {
+		if (!statSync(file).isFile()) return evidence;
+	} catch {
+		return evidence;
+	}
+	return `\x1b]8;;${pathToFileURL(file).href}\x1b\\${m[0]}\x1b]8;;\x1b\\${evidence.slice(m[0].length)}`;
+}
+
+type Act = "explain" | "knew" | "ask" | "dismiss" | "got_it" | "simpler_words" | "less_detail" | "more_detail" | "undo";
+const NOTE_BUTTONS: Button<Act>[] = [
+	{ label: "Explain", action: "explain" },
+	{ label: "Knew it", action: "knew" },
+	{ label: "Ask agent", action: "ask" },
+	{ label: "Dismiss", action: "dismiss", dim: true },
+];
+const EXPLAINED_BUTTONS: Button<Act>[] = [
+	{ label: "Got it", action: "got_it" },
+	{ label: "Ask agent", action: "ask" },
+	{ label: "Simpler", action: "simpler_words" },
+	{ label: "Shorter", action: "less_detail" },
+	{ label: "More detail", action: "more_detail" },
+	{ label: "Dismiss", action: "dismiss", dim: true },
+];
+// The keyboard explanation screen: the same choices, labelled with their keys.
+const EXPLAIN_SCREEN_BUTTONS: Button<string>[] = [
+	{ label: "1 Got it", action: "understood" },
+	{ label: "2 Ask agent", action: "chat" },
+	{ label: "s Simpler", action: "simpler_words" },
+	{ label: "l Shorter", action: "less_detail" },
+	{ label: "m More detail", action: "more_detail" },
+	{ label: "0 Dismiss", action: "dismiss", dim: true },
+];
+
 const textOf = (msg: { content: unknown }) =>
 	Array.isArray(msg.content)
 		? msg.content
@@ -164,7 +265,13 @@ const textOf = (msg: { content: unknown }) =>
 
 export default function (pi: ExtensionAPI) {
 	let state = loadState();
-	let notes: Note[] = []; // oldest first; notes[0] is the one /ysk and alt+x act on
+	let notes: Note[] = []; // oldest first; /ysk and alt+x act on current(): the open note, else notes[0]
+	// Fullscreen mouse: which note is open under its line, its explanation, and the last undoable answer.
+	let expandedId: string | undefined;
+	type View = { text?: string; md?: Markdown; writing?: boolean; error?: string };
+	const views = new Map<string, View>();
+	let undo: { note: Note; index: number; action: "knew" | "dismiss"; timer: ReturnType<typeof setTimeout> } | undefined;
+	const current = () => notes.find((n) => n.id === expandedId) ?? notes[0];
 	let answered = new Map<string, { note: Note; action: string }>();
 	let inFlight: AbortController | undefined;
 	let promptCounter = 0; // stands in for CC's turnId staleness check
@@ -197,33 +304,173 @@ export default function (pi: ExtensionAPI) {
 	const render = (ctx: ExtensionContext) => {
 		persistNotes(ctx);
 		if (ctx.mode !== "tui") return;
-		if (notes.length === 0) {
+		if (notes.length === 0 && !undo) {
 			ctx.ui.setWidget(WIDGET, undefined);
 			return;
 		}
-		const shown = [...notes];
-		ctx.ui.setWidget(WIDGET, (_tui, theme) => {
-			const c = new Container();
-			shown.forEach((n, i) => {
-				const mark = i === 0 ? theme.fg("accent", "\u2726 ") : theme.fg("dim", "\u2727 ");
-				const tag = i === 0 ? theme.fg("accent", theme.bold(n.tag)) : theme.fg("dim", n.tag);
-				const from = n.from ? theme.fg("dim", ` (${n.from})`) : "";
-				c.addChild(new Text(mark + tag + from + theme.fg("dim", " \u00b7 ") + n.line, 0, 0));
-			});
-			return c;  // (no key hint line: alt+x dismisses, /ysk or alt+shift+y responds)
-		});
+		ctx.ui.setWidget(WIDGET, (_tui, theme) => notesWidget(ctx, theme));
+	};
+
+	// One line per note (no key hint line: alt+x dismisses, /ysk or alt+shift+y responds).
+	// In fullscreen mode, clicking a note opens it: evidence, explanation and a row of buttons.
+	type Row = { note?: Note; hits?: Hit<Act>[] };
+	const notesWidget = (ctx: ExtensionContext, theme: any): Component => {
+		let rows: Row[] = [];
+		return {
+			render(width: number) {
+				const lines: string[] = [];
+				rows = [];
+				const add = (ls: string[], row: Row) => {
+					for (const l of ls) {
+						lines.push(truncateToWidth(l, width, ""));
+						rows.push(row);
+					}
+				};
+				const lead = current();
+				const items: (Note | undefined)[] = [...notes];
+				if (undo) items.splice(Math.min(undo.index, items.length), 0, undefined);
+				for (const n of items) {
+					if (!n) {
+						const prefix = "  " + theme.fg("dim", `${undo!.action === "knew" ? "Marked as known" : "Dismissed"} \u00b7 `);
+						const x0 = visibleWidth(prefix);
+						add([prefix + theme.fg("accent", "Undo")], { hits: [{ x0, x1: x0 + 4, action: "undo" }] });
+						continue;
+					}
+					const on = n === lead;
+					const mark = on ? theme.fg("accent", "\u2726 ") : theme.fg("dim", "\u2727 ");
+					const tag = on ? theme.fg("accent", theme.bold(n.tag)) : theme.fg("dim", n.tag);
+					const from = n.from ? theme.fg("dim", ` (${n.from})`) : "";
+					add(wrapTextWithAnsi(mark + tag + from + theme.fg("dim", " \u00b7 ") + n.line, width), { note: n });
+					if (n.id !== expandedId) continue;
+					if (n.evidence) add(wrapTextWithAnsi("  " + theme.fg("dim", "Evidence: ") + linkEvidence(n.evidence, ctx.cwd), width), {});
+					const v = views.get(n.id);
+					if (v?.md) add(v.md.render(width), {});
+					if (v?.error) add(wrapTextWithAnsi("  " + theme.fg("error", v.error), width), {});
+					if (v?.writing) {
+						add(["  " + theme.fg("dim", "Writing\u2026")], {});
+						continue;
+					}
+					const laid = layoutButtons(v?.md ? EXPLAINED_BUTTONS : NOTE_BUTTONS, width, 2, theme);
+					laid.lines.forEach((l, i) => add([l], { note: n, hits: laid.hits[i] }));
+				}
+				return lines;
+			},
+			handleMouse(e: TuiMouseEvent) {
+				const row = rows[e.y];
+				if (!row) return undefined;
+				const action = clicked(row.hits, e);
+				if (action) {
+					void act(ctx, action, row.note);
+					return { handled: true };
+				}
+				if (row.note && !row.hits && e.type === "click" && e.button === "left") {
+					toggle(ctx, row.note);
+					return { handled: true };
+				}
+				return undefined;
+			},
+			invalidate() {
+				for (const v of views.values()) v.md?.invalidate();
+			},
+		};
 	};
 
 	const clearNotes = (ctx: ExtensionContext) => {
 		notes = [];
+		expandedId = undefined;
+		views.clear();
 		render(ctx);
 	};
 
-	const popNote = (ctx: ExtensionContext) => {
-		const n = notes.shift();
-		render(ctx);
-		return n;
+	// Any answer, or opening a note, counts as paying attention: checks go back to full frequency.
+	const engage = () => {
+		state.ignoredInARow = 0;
+		state.skip = 0;
+		saveState(state);
 	};
+
+	/** Take a note off the list. Mouse answers that lose something (knew, dismiss) can be undone for a few seconds. */
+	function removeNote(ctx: ExtensionContext, n: Note, undoable?: "knew" | "dismiss") {
+		const index = notes.indexOf(n);
+		notes = notes.filter((x) => x !== n);
+		views.delete(n.id);
+		if (expandedId === n.id) expandedId = undefined;
+		if (undo) clearTimeout(undo.timer);
+		undo = undefined;
+		if (undoable) {
+			const timer = setTimeout(() => {
+				if (undo?.timer !== timer) return;
+				undo = undefined;
+				render(ctx);
+			}, UNDO_MS);
+			timer.unref?.();
+			undo = { note: n, index, action: undoable, timer };
+		}
+		engage();
+		render(ctx);
+	}
+
+	function restore(ctx: ExtensionContext) {
+		if (!undo) return;
+		const { note, index, action, timer } = undo;
+		clearTimeout(timer);
+		undo = undefined;
+		notes.splice(Math.min(index, notes.length), 0, note);
+		if (action === "knew") remember(note.line, false);
+		log({ event: "undo", answer: action, via: "mouse", line: note.line });
+		render(ctx);
+	}
+
+	function toggle(ctx: ExtensionContext, n: Note) {
+		expandedId = expandedId === n.id ? undefined : n.id;
+		if (expandedId) {
+			engage();
+			log({ event: "expand", via: "mouse", line: n.line, msToAnswer: Date.now() - n.shownAt });
+		}
+		render(ctx);
+	}
+
+	/** Explain a note under its line, or rewrite the explanation already there. */
+	async function writeInline(ctx: ExtensionContext, n: Note, direction: Direction) {
+		const v: View = views.get(n.id) ?? {};
+		views.set(n.id, v);
+		if (v.writing) return;
+		const show = (text: string) => {
+			v.text = text;
+			v.md = new Markdown(text, 2, 0, getMarkdownTheme());
+		};
+		if (direction === "first" && n.explanation) {
+			show(n.explanation);
+			render(ctx);
+			return;
+		}
+		v.writing = true;
+		v.error = undefined;
+		render(ctx);
+		try {
+			const prev = direction !== "first" && v.text ? { direction, text: v.text } : undefined;
+			const r = await fork(ctx, lastLlmMessages, explainPrompt(n.line, prev), new AbortController().signal);
+			if (r.text) show(r.text);
+			else v.error = "No explanation came back.";
+		} catch (err) {
+			v.error = `Couldn\u2019t write that explanation: ${err}`;
+		}
+		v.writing = false;
+		if (views.get(n.id) === v) render(ctx); // the note may have been answered meanwhile
+	}
+
+	async function act(ctx: ExtensionContext, a: Act, n?: Note) {
+		if (a === "undo") return restore(ctx);
+		if (!n || !notes.includes(n)) return;
+		if (a === "explain") return writeInline(ctx, n, "first");
+		if (a === "simpler_words" || a === "less_detail" || a === "more_detail") return writeInline(ctx, n, a);
+		const explanation = views.get(n.id)?.text;
+		removeNote(ctx, n, a === "knew" || a === "dismiss" ? a : undefined);
+		if (a === "knew") remember(n.line, true);
+		if (a === "ask") chatInMain(n, explanation ?? n.explanation);
+		const answer = { knew: "knew", dismiss: "dismiss", ask: "chat", got_it: "understood" }[a];
+		log({ event: "answer", answer, via: "mouse", explained: !!explanation, line: n.line, msToAnswer: Date.now() - n.shownAt });
+	}
 
 	async function fork(ctx: ExtensionContext, llmMessages: any[], prompt: string, signal: AbortSignal) {
 		const model = pickModel(ctx);
@@ -382,6 +629,10 @@ export default function (pi: ExtensionAPI) {
 		inFlight = undefined;
 		notes = [];
 		answered = new Map();
+		expandedId = undefined;
+		views.clear();
+		if (undo) clearTimeout(undo.timer);
+		undo = undefined;
 		try {
 			const file = notesFile(ctx);
 			if (file) {
@@ -527,11 +778,14 @@ export default function (pi: ExtensionAPI) {
 				const border = new DynamicBorder((s: string) => theme.fg("accent", s));
 				c.addChild(border);
 				c.addChild(new Text(theme.fg("accent", `\u2726 ${n.tag}`), 1, 0));
-				c.addChild(new Markdown(text!, 1, 1, getMarkdownTheme()));  // (keys, unlisted: 1/Enter understood, 2 chat, s simpler, l less, m more, 0/Esc dismiss)
+				c.addChild(new Markdown(text!, 1, 1, getMarkdownTheme()));
+				// Enter and Esc also work: Enter means Got it, Esc means Dismiss.
+				c.addChild(new ButtonRow(EXPLAIN_SCREEN_BUTTONS, theme, done));
 				c.addChild(border);
 				return {
 					render: (w: number) => c.render(w),
 					invalidate: () => c.invalidate(),
+					handleMouse: (e: TuiMouseEvent) => c.handleMouse(e),
 					handleInput: (d: string) => {
 						if (d === "1" || matchesKey(d, "enter")) done("understood");
 						else if (d === "2") done("chat");
@@ -617,23 +871,16 @@ export default function (pi: ExtensionAPI) {
 			ctx.ui.notify("Answer notes where your client shows them.", "info");
 			return;
 		}
-		const n = notes[0];
+		const n = current();
 		const options = ["1 Learn more", "2 Knew this already", "3 Chat in main session", "0 Dismiss"];
 		const pick = await ctx.ui.select(`${n.tag} \u00b7 ${n.line}`, options);
-		if (!pick) return;
-		if (notes[0] === n) popNote(ctx);
-		else {
-			notes = notes.filter((x) => x !== n);
-			render(ctx);
-		}
-		state.ignoredInARow = 0;
-		state.skip = 0;
+		if (!pick || !notes.includes(n)) return;
+		removeNote(ctx, n);
 		const k = pick[0];
 		log({ event: "answer", answer: { "1": "learn_more", "2": "knew", "3": "chat", "0": "dismiss" }[k], line: n.line, msToAnswer: Date.now() - n.shownAt });
 		if (k === "1") await showExplanation(ctx, n).catch((err) => ctx.ui.notify(`Couldn\u2019t write that explanation: ${err}`, "error"));
 		else if (k === "2") remember(n.line, true);
 		else if (k === "3") chatInMain(n, n.explanation);
-		saveState(state);
 	}
 
 	// RPC clients answer notes in their own UI, then send `/ysk answer <id> <action>`
@@ -667,13 +914,11 @@ export default function (pi: ExtensionAPI) {
 		log({ event: "answer", answer, via: "client", line: n.line, msToAnswer: Date.now() - n.shownAt });
 	}
 
-	// One keystroke: dismiss the top note, no menu.
+	// One keystroke: dismiss the current note, no menu.
 	function quickDismiss(ctx: ExtensionContext) {
-		const n = popNote(ctx);
+		const n = current();
 		if (!n) return;
-		state.ignoredInARow = 0;
-		state.skip = 0;
-		saveState(state);
+		removeNote(ctx, n);
 		log({ event: "answer", answer: "dismiss", via: "alt+x", line: n.line, msToAnswer: Date.now() - n.shownAt });
 	}
 

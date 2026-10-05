@@ -11,7 +11,7 @@ const data = (source) => `data:text/javascript,${encodeURIComponent(source)}`;
 registerHooks({ resolve(specifier, context, next) {
   if (specifier === 'node:os') return { url: data(`export const homedir = () => ${JSON.stringify(home)}`), shortCircuit: true };
   if (specifier === '@earendil-works/pi-coding-agent') return { url: data('export class DynamicBorder {}; export const getMarkdownTheme = () => ({})'), shortCircuit: true };
-  if (specifier === '@earendil-works/pi-tui') return { url: data('export class Container {}; export class Markdown {}; export class Text {}; export const matchesKey = () => false'), shortCircuit: true };
+  if (specifier === '@earendil-works/pi-tui') return { url: data('export class Container {}; export class Markdown {}; export class Text {}; export const matchesKey = () => false; export const truncateToWidth = (s) => s; export const visibleWidth = (s) => s.length; export const wrapTextWithAnsi = (s) => [s]'), shortCircuit: true };
   return next(specifier, context);
 }});
 const { default: extension } = await import(process.env.YSK_TEST_SOURCE ?? '../extensions/you-should-know/index.ts');
