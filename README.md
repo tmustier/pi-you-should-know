@@ -8,7 +8,7 @@ It's a port of the "you should know" plugin built into Claude Code.
 
 ## Using it
 
-- A note shows up above the editor, like `✦ Heads up · The agent loosened the test threshold from 0.8 to 0.65.`
+- The oldest note shows above the editor with its message on a separate, indented line. If more notes are waiting, the widget shows a compact queue count instead of stacking every message.
 - `/ysk` or alt+shift+y: open the top note. You can learn more about it, mark it as something you knew, send it to the agent or dismiss it.
 - alt+x: dismiss the top note.
 - `/ysk off`, `/ysk on`, `/ysk status`: turn it off and on, or see how many checks it has run.

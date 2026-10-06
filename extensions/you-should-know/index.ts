@@ -201,15 +201,17 @@ export default function (pi: ExtensionAPI) {
 			ctx.ui.setWidget(WIDGET, undefined);
 			return;
 		}
-		const shown = [...notes];
+		const shown = notes[0];
+		const queued = notes.length - 1;
 		ctx.ui.setWidget(WIDGET, (_tui, theme) => {
 			const c = new Container();
-			shown.forEach((n, i) => {
-				const mark = i === 0 ? theme.fg("accent", "\u2726 ") : theme.fg("dim", "\u2727 ");
-				const tag = i === 0 ? theme.fg("accent", theme.bold(n.tag)) : theme.fg("dim", n.tag);
-				const from = n.from ? theme.fg("dim", ` (${n.from})`) : "";
-				c.addChild(new Text(mark + tag + from + theme.fg("dim", " \u00b7 ") + n.line, 0, 0));
-			});
+			const mark = theme.fg("accent", "\u2726 ");
+			const tag = theme.fg("accent", theme.bold(shown.tag));
+			const from = shown.from ? theme.fg("dim", ` (${shown.from})`) : "";
+			const count = notes.length > 1 ? theme.fg("dim", ` \u00b7 ${notes.length} notes`) : "";
+			c.addChild(new Text(mark + tag + from + count, 0, 0));
+			c.addChild(new Text(shown.line, 2, 0));
+			if (queued > 0) c.addChild(new Text(theme.fg("dim", `${queued} more queued`), 2, 0));
 			return c;  // (no key hint line: alt+x dismisses, /ysk or alt+shift+y responds)
 		});
 	};
