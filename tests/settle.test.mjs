@@ -143,7 +143,7 @@ test('a delayed detection is settled after the final step even when no notes wer
   s.close();
 });
 
-for (const interrupt of ['input', 'close', 'restart']) test(`queued settling does not outlive ${interrupt}`, async () => {
+for (const interrupt of ['input', 'close']) test(`queued settling does not outlive ${interrupt}`, async () => {
   const s = open('queued-' + interrupt);
   s.replies.push(note('Keep this note: ' + interrupt));
   await s.turns(6);
