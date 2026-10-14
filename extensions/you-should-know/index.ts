@@ -903,9 +903,10 @@ export default function (pi: ExtensionAPI) {
 		if (!state.enabled || ctx.mode !== "tui" || CHILD_INBOX) return;
 		const messages = lastLlmMessages;
 		const generation = sessionGeneration, askedAt = promptCounter, turn = turnCount;
+		const pending = inFlightTask;
 		// Do not return this promise: Pi must reach idle while side requests finish.
-		void (async () => {
-			await inFlightTask;
+		inFlightTask = (async () => {
+			await pending;
 			if (generation !== sessionGeneration || askedAt !== promptCounter || turn !== turnCount || !state.enabled ||
 				inFlight || notes.length === 0 || askedAtTurn === turnCount) return;
 			const ac = new AbortController();
@@ -915,28 +916,26 @@ export default function (pi: ExtensionAPI) {
 			const t0 = Date.now();
 			let outcome = "error";
 			let extra: CheckDetails = {};
-			inFlightTask = (async () => {
-				try {
-					const { text, ...result } = await fork(ctx, messages, settlePrompt(waiting), ac.signal);
-					extra = result;
-					if (ac.signal.aborted || result.stopReason === "aborted") outcome = "aborted";
-					else if (result.stopReason === "error") outcome = "error";
-					else if (promptCounter !== askedAt || turnCount !== turn) outcome = "stale";
-					else {
-						const settled = parseSettled(text, waiting);
-						extra.settled = settled.length;
-						settle(ctx, settled, "end");
-						outcome = "done";
-					}
-				} catch (err) {
-					outcome = ac.signal.aborted ? "aborted" : "error";
-					extra.error = String(err);
-				} finally {
-					if (inFlight === ac) inFlight = undefined;
-					log({ event: "settle", outcome, waiting: waiting.length, ms: Date.now() - t0, ...extra });
-					if (DEBUG) ctx.ui.notify(`you-should-know: settle \u2192 ${outcome}, ${extra.settled ?? 0} of ${waiting.length} (${Date.now() - t0}ms)`, "info");
+			try {
+				const { text, ...result } = await fork(ctx, messages, settlePrompt(waiting), ac.signal);
+				extra = result;
+				if (ac.signal.aborted || result.stopReason === "aborted") outcome = "aborted";
+				else if (result.stopReason === "error") outcome = "error";
+				else if (promptCounter !== askedAt || turnCount !== turn) outcome = "stale";
+				else {
+					const settled = parseSettled(text, waiting);
+					extra.settled = settled.length;
+					settle(ctx, settled, "end");
+					outcome = "done";
 				}
-			})();
+			} catch (err) {
+				outcome = ac.signal.aborted ? "aborted" : "error";
+				extra.error = String(err);
+			} finally {
+				if (inFlight === ac) inFlight = undefined;
+				log({ event: "settle", outcome, waiting: waiting.length, ms: Date.now() - t0, ...extra });
+				if (DEBUG) ctx.ui.notify(`you-should-know: settle \u2192 ${outcome}, ${extra.settled ?? 0} of ${waiting.length} (${Date.now() - t0}ms)`, "info");
+			}
 		})();
 	});
 
