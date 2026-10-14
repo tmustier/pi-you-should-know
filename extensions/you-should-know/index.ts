@@ -578,7 +578,8 @@ export default function (pi: ExtensionAPI) {
 		const res = same
 			? await ctx.modelRegistry.complete(model, context, options)
 			: await ctx.modelRegistry.streamSimple(model, context, { ...options, reasoning: thinking, toolChoice: "none" }).result();
-		return { text: textOf(res), usage: res.usage, stopReason: res.stopReason, error: res.errorMessage, provider: model.provider, model: model.id, thinking };
+		const cache = DEBUG && same && res.stopReason !== "error" ? cacheCheck(ctx, res.usage) : undefined;
+		return { text: textOf(res), usage: res.usage, stopReason: res.stopReason, error: res.errorMessage, provider: model.provider, model: model.id, thinking, cache };
 	}
 
 	let lastLlmMessages: any[] = [];
@@ -598,6 +599,31 @@ export default function (pi: ExtensionAPI) {
 		mainPayload = p as Record<string, unknown>;
 	});
 
+	/**
+	 * YSK_DEBUG only: is a same-model check actually reading the main request's cache?
+	 * A check repeats the beginning of the main request it copied, so it should read from
+	 * cache at least everything that main request read or wrote there. Less means the
+	 * copy differs from what was sent, usually because another extension changes requests
+	 * after this one sees them (Pi runs request hooks in extension load order).
+	 */
+	const cachedByMain = new WeakMap<object, number>();
+	let copiedMain: object | undefined; // the main request the last same-model check copied
+	pi.on("message_end", (e) => {
+		const usage = (e.message as any)?.role === "assistant" ? (e.message as any).usage : undefined;
+		if (DEBUG && usage && mainPayload) cachedByMain.set(mainPayload, (usage.cacheRead ?? 0) + (usage.cacheWrite ?? 0));
+	});
+	const cacheCheck = (ctx: ExtensionContext, usage: any) => {
+		const expected = copiedMain && cachedByMain.get(copiedMain);
+		if (!expected) return undefined; // the copied request is still streaming, or cached nothing
+		const read = usage?.cacheRead ?? 0;
+		if (read < expected)
+			ctx.ui.notify(
+				`you-should-know: a check read ${read} tokens from cache, fewer than the ${expected} the main request had there. Another extension may change requests after this one copies them.`,
+				"warning",
+			);
+		return { read, expected, ok: read >= expected };
+	};
+
 	/** How the last fork lined up with the main request; logged with each check. */
 	let lastAlign: Record<string, unknown> = {};
 
@@ -616,11 +642,13 @@ export default function (pi: ExtensionAPI) {
 	const alignWithMain = (forked: unknown): unknown => {
 		const main = mainPayload;
 		lastAlign = { aligned: false };
+		copiedMain = undefined;
 		if (!main || !forked || typeof forked !== "object") return markFork(undefined, (lastAlign.why = "no main payload"));
 		const f = forked as Record<string, unknown>;
 		if (main["model"] !== f["model"]) return markFork(undefined, (lastAlign.why = "model differs"));
 		const key = Array.isArray(f["messages"]) ? "messages" : Array.isArray(f["input"]) ? "input" : undefined;
 		if (!key || !Array.isArray(main[key])) return markFork(undefined, (lastAlign.why = "no message list"));
+		copiedMain = main;
 		if (key === "input") return markFork({ ...main, input: f["input"] }, undefined, true);
 		const mainMsgs = main[key] as any[];
 		const forkMsgs = (f[key] as any[]).map(unmark);
@@ -835,7 +863,7 @@ export default function (pi: ExtensionAPI) {
 			let extra: Record<string, unknown> = {};
 			try {
 				const r = await fork(ctx, lastLlmMessages, detectPrompt(seen, known, waiting, queueFull), ac.signal);
-				extra = { usage: r.usage, stopReason: r.stopReason, error: r.error, provider: r.provider, model: r.model, thinking: r.thinking, waiting: waiting.length };
+				extra = { usage: r.usage, stopReason: r.stopReason, error: r.error, provider: r.provider, model: r.model, thinking: r.thinking, cache: r.cache, waiting: waiting.length };
 				if (ac.signal.aborted || r.stopReason === "aborted") outcome = "aborted";
 				else if (r.stopReason === "error") outcome = "error";
 				else if (!r.text) outcome = "empty";
@@ -915,7 +943,7 @@ export default function (pi: ExtensionAPI) {
 		inFlightTask = (async () => {
 			try {
 				const r = await fork(ctx, messages, settlePrompt(waiting), ac.signal);
-				extra = { usage: r.usage, stopReason: r.stopReason, error: r.error, provider: r.provider, model: r.model, thinking: r.thinking };
+				extra = { usage: r.usage, stopReason: r.stopReason, error: r.error, provider: r.provider, model: r.model, thinking: r.thinking, cache: r.cache };
 				if (ac.signal.aborted || r.stopReason === "aborted") outcome = "aborted";
 				else if (r.stopReason === "error") outcome = "error";
 				else {

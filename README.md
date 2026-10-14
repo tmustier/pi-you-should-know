@@ -50,6 +50,8 @@ The existing `YSK_MODEL` environment variable overrides the model for any family
 
 A same-model check copies the main request (tools, system prompt, thinking) and adds only the new turn and the question, so most of its input is read from cache. This also works when another extension puts a message in front of the main request, as the Anthropic OAuth fix does. Pi does not run other extensions' request hooks on a check's own request, so an extension that rewrites requests (such as the OAuth fix) must load before this one. Every check is logged, with token usage, to `~/.pi/agent/you-should-know/checks.jsonl`.
 
+To check that the cache is working, start Pi with `YSK_DEBUG=1`. Each check then reports its outcome, and a same-model check also compares how much it read from cache with how much the main request it copied read or wrote there. It should be at least as much, because the check repeats the start of that request. When it is less, Pi shows a warning and `checks.jsonl` records `cache: { read, expected, ok: false }`.
+
 ## Install
 
     pi install git:github.com/aliceisjustplaying/pi-you-should-know

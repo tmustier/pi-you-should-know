@@ -21,6 +21,8 @@ const cases = [
   { name: 'Fable configurable model and thinking', api: 'anthropic-messages', provider: 'anthropic', main: 'claude-fable-5', side: 'claude-sonnet-5', thinking: 'high', config: { fable: { model: 'anthropic/claude-sonnet-5', thinking: 'high' } } },
   { name: 'other Claude preserves cache and thinking', api: 'anthropic-messages', provider: 'anthropic', main: 'claude-sonnet-5', side: 'claude-sonnet-5', thinking: 'low', cached: true },
   { name: 'Claude cache survives a leading message another extension adds', api: 'anthropic-messages', provider: 'anthropic', main: 'claude-sonnet-5', side: 'claude-sonnet-5', thinking: 'low', cached: true, inject: true },
+  { name: 'debug check passes a check that reads the main cache', api: 'anthropic-messages', provider: 'anthropic', main: 'claude-sonnet-5', side: 'claude-sonnet-5', thinking: 'low', cached: true, cacheUsage: { main: [1000, 200], side: 1200 } },
+  { name: 'debug check flags a check that misses the main cache', api: 'anthropic-messages', provider: 'anthropic', main: 'claude-sonnet-5', side: 'claude-sonnet-5', thinking: 'low', cached: true, cacheUsage: { main: [1000, 200], side: 100 } },
   { name: 'unknown configured model does not fall back to main', api: 'openai-responses', provider: 'openai', main: 'gpt-6-astra', side: 'gpt-6-sol', config: { gpt: { model: 'openai/not-a-registered-model' } }, missing: true },
   { name: 'GPT provider error is not an empty answer', api: 'openai-responses', provider: 'openai', main: 'gpt-6-astra', side: 'gpt-6-sol', thinking: 'high', config: { gpt: { model: 'openai/gpt-6-sol', thinking: 'high' } }, error: true },
 ];
@@ -61,7 +63,8 @@ for (const scenario of cases) test(scenario.name, { timeout: 20_000 }, async () 
     response.writeHead(200, { 'content-type': 'text/event-stream' });
     const event = (type, fields) => response.write(`event: ${type}\ndata: ${JSON.stringify({ type, ...fields })}\n\n`);
     if (scenario.api === 'anthropic-messages') {
-      event('message_start', { message: { id: 'msg_fixture', type: 'message', role: 'assistant', model: payload.model, content: [], usage: { input_tokens: 10, output_tokens: 0 } } });
+      const cacheUsage = scenario.cacheUsage ? (side ? { cache_read_input_tokens: scenario.cacheUsage.side } : { cache_read_input_tokens: scenario.cacheUsage.main[0], cache_creation_input_tokens: scenario.cacheUsage.main[1] }) : {};
+      event('message_start', { message: { id: 'msg_fixture', type: 'message', role: 'assistant', model: payload.model, content: [], usage: { input_tokens: 10, output_tokens: 0, ...cacheUsage } } });
       event('content_block_start', { index: 0, content_block: tool ? { type: 'tool_use', id: `read_${steps}`, name: 'read', input: {} } : { type: 'text', text: '' } });
       event('content_block_delta', { index: 0, delta: tool ? { type: 'input_json_delta', partial_json: JSON.stringify({ path: receipt }) } : { type: 'text_delta', text } });
       event('content_block_stop', { index: 0 });
@@ -130,6 +133,11 @@ for (const scenario of cases) test(scenario.name, { timeout: 20_000 }, async () 
       assert.deepEqual(sidePayload.tools, mainPayload.tools);
       assert.deepEqual(sidePayload.system ?? sidePayload.instructions, mainPayload.system ?? mainPayload.instructions);
       assert.notEqual(check.align.why, 'independent side request');
+      if (scenario.cacheUsage) {
+        const ok = scenario.cacheUsage.side >= 1200;
+        assert.deepEqual(check.cache, { read: scenario.cacheUsage.side, expected: 1200, ok });
+        assert.equal(notices.some(n => n.startsWith('you-should-know: a check read')), !ok);
+      } else assert.equal(check.cache, undefined);
       if (scenario.inject) {
         assert.equal(sidePayload.messages[0].content[0].text, '<system-reminder>moved context</system-reminder>');
         assert.equal(sidePayload.messages.filter(m => m.content?.[0]?.text === '<system-reminder>moved context</system-reminder>').length, 1);
