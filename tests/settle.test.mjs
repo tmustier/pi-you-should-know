@@ -33,7 +33,7 @@ function open(session) {
   extension({ on: (event, handler) => handlers.set(event, handler), registerCommand() {}, registerShortcut() {} });
   const ctx = {
     mode: 'tui', hasUI: true, cwd: home, isIdle: () => false,
-    model: { id: 'fixture', provider: 'fixture', api: 'fixture' },
+    model: { id: 'fixture', provider: 'fixture', api: 'anthropic-messages' },
     getSystemPrompt: () => 'system',
     modelRegistry: { complete: async (_model, context) => {
       prompts.push(context.messages.at(-1).content[0].text);
