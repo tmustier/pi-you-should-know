@@ -59,7 +59,7 @@ function open(session) {
     restart: () => handlers.get('session_start')({}, ctx),
     // Pi numbers turns within a run; a check runs on every sixth.
     turns: async (n) => { for (let i = 0; i < n; i++) { handlers.get('turn_end')({ turnIndex: ++turn, context: llm }, ctx); await settleDown(); } },
-    end: async () => { handlers.get('agent_before_settle')({ context: llm }, ctx); await settleDown(); turn = 0; },
+    end: async () => { await handlers.get('agent_before_settle')({ context: llm }, ctx); await settleDown(); turn = 0; },
     lines: () => {
       const component = widget?.(null, { fg: (_n, t) => t, bold: (t) => t });
       return component ? component.render(200) : [];
@@ -128,7 +128,7 @@ test('a full queue keeps its notes and holds new ones back for later', async () 
   s.close();
 });
 
-test('a delayed detection is settled after the final step even when no notes were waiting', async () => {
+test('a delayed detection is settled after the final step even when no notes were waiting', { timeout: 2000 }, async () => {
   const s = open('delayed-detection');
   const pending = Promise.withResolvers();
   s.replies.push(pending.promise, 'settled: #1');

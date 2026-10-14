@@ -18,7 +18,7 @@ import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import type { ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
-import type { Context, Message, Usage } from "@earendil-works/pi-ai";
+import type { Context, Message } from "@earendil-works/pi-ai";
 import { DynamicBorder, getMarkdownTheme } from "@earendil-works/pi-coding-agent";
 import type { Component, TuiMouseEvent } from "@earendil-works/pi-tui";
 import { Container, Markdown, matchesKey, Text, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
@@ -293,8 +293,12 @@ function payload(value: unknown): Payload | undefined {
 		(m.content == null || typeof m.content === "string" || Array.isArray(m.content) &&
 			m.content.every((b: unknown) => isObject(b) && typeof b.type === "string")))) return value as Payload;
 }
-type Alignment = { aligned: boolean; why?: string; mainLen?: number; forkLen?: number; lead?: number; common?: number };
-type Aligned = { payload?: Payload; copiedMain?: Payload; align: Alignment };
+type Aligned =
+	| { align: { aligned: false; why: string }; payload?: never; copiedMain?: never }
+	| { align: { aligned: true } & (
+		{ format: "messages"; mainLen: number; forkLen: number; lead: number; common: number } |
+		{ format: "responses" }
+	); payload: Payload; copiedMain?: Payload };
 
 export default function (pi: ExtensionAPI) {
 	let state = loadState();
@@ -570,16 +574,16 @@ export default function (pi: ExtensionAPI) {
 		];
 		const hasSystem = llmMessages[0]?.role === "system";
 		const context: Context = { messages, ...(hasSystem ? {} : { systemPrompt: ctx.getSystemPrompt() }) };
-		let aligned: Aligned = { align: { aligned: false, why: "independent side request" } };
+		let aligned: Aligned | undefined;
 		const options = {
 			signal, sessionId: ctx.sessionManager.getSessionId(),
 			onPayload: (p: unknown) => {
 				// Cache alignment copies the main request (tools, system, thinking), so it must
 				// not overwrite a routed model's converted history or its own thinking setting.
 				if (same) aligned = alignWithMain(payload(p));
-				const sent = aligned.payload ?? p;
+				const sent = aligned?.payload ?? p;
 				if (isObject(sent)) forkPayloads.add(sent);
-				return aligned.payload;
+				return aligned?.payload;
 			},
 		};
 		// The same-model request reuses the main request's payload. Routes use Pi's neutral
@@ -587,9 +591,19 @@ export default function (pi: ExtensionAPI) {
 		const res = same
 			? await ctx.modelRegistry.complete(model, context, options)
 			: await ctx.modelRegistry.streamSimple(model, context, { ...options, reasoning: thinking === "off" ? undefined : thinking, toolChoice: "none" }).result();
-		const cache = DEBUG && res.stopReason !== "error" ? cacheCheck(ctx, res.usage, aligned.copiedMain) : undefined;
+		let cache: { read: number; expected: number; ok: boolean } | undefined;
+		const expected = aligned?.copiedMain && cachedByMain.get(aligned.copiedMain);
+		if (DEBUG && res.stopReason !== "error" && expected) {
+			const read = res.usage.cacheRead;
+			cache = { read, expected, ok: read >= expected };
+			if (!cache.ok) ctx.ui.notify(
+				`you-should-know: a check read ${read} tokens from cache, fewer than the ${expected} the main request had there. Another extension may change requests after this one copies them.`,
+				"warning",
+			);
+		}
 		const text = res.content.filter((c) => c.type === "text").map((c) => c.text).join("\n").trim();
-		return { text, usage: res.usage, stopReason: res.stopReason, error: res.errorMessage, provider: model.provider, model: model.id, thinking, cache, align: aligned.align };
+		const align = aligned?.align ?? { aligned: false as const, why: "independent side request" };
+		return { text, usage: res.usage, stopReason: res.stopReason, error: res.errorMessage, provider: model.provider, model: model.id, thinking, cache, align };
 	}
 
 	let lastLlmMessages: Message[] = [];
@@ -610,17 +624,6 @@ export default function (pi: ExtensionAPI) {
 		const usage = e.message.role === "assistant" ? e.message.usage : undefined;
 		if (DEBUG && usage && mainPayload) cachedByMain.set(mainPayload, usage.cacheRead + usage.cacheWrite);
 	});
-	const cacheCheck = (ctx: ExtensionContext, usage: Usage, copiedMain?: Payload) => {
-		const expected = copiedMain && cachedByMain.get(copiedMain);
-		if (!expected) return undefined; // the copied request is still streaming, or cached nothing
-		const read = usage.cacheRead;
-		if (read < expected)
-			ctx.ui.notify(
-				`you-should-know: a check read ${read} tokens from cache, fewer than the ${expected} the main request had there. Another extension may change requests after this one copies them.`,
-				"warning",
-			);
-		return { read, expected, ok: read >= expected };
-	};
 
 	// Keep main's cache markers: moving them beyond Anthropic's lookback window loses
 	// the cached prefix. New messages and the side prompt remain unmarked.
@@ -629,7 +632,7 @@ export default function (pi: ExtensionAPI) {
 		if (!main || !f) return { align: { aligned: false, why: "no main payload" } };
 		if (main.model !== f.model) return { align: { aligned: false, why: "model differs" } };
 		if (main.input && f.input) return {
-			payload: { ...main, input: f.input }, align: { aligned: true },
+			payload: { ...main, input: f.input }, align: { aligned: true, format: "responses" },
 			copiedMain: JSON.stringify(main.input) === JSON.stringify(f.input.slice(0, main.input.length)) ? main : undefined,
 		};
 		if (!main.messages || !f.messages) return { align: { aligned: false, why: "no message list" } };
@@ -638,20 +641,30 @@ export default function (pi: ExtensionAPI) {
 		// Another extension may put messages in front of the main request after Pi builds it (the
 		// Anthropic OAuth fix moves the system prompt into a leading user message), so the fork's
 		// first message can match a later one in main. Main's leading messages are kept as sent.
-		const { lead, common } = alignment(mainMsgs, forkMsgs);
+		let lead = 0, common = 0;
+		for (let start = 0; start < mainMsgs.length && common < mainMsgs.length - start; start++) {
+			let matched = 0;
+			while (start + matched < mainMsgs.length && matched < forkMsgs.length &&
+				JSON.stringify(unmark(mainMsgs[start + matched])) === JSON.stringify(forkMsgs[matched])) matched++;
+			if (matched > common) { lead = start; common = matched; }
+		}
 		const same = lead + common;
-		const align = { aligned: true, mainLen: mainMsgs.length, forkLen: forkMsgs.length, lead, common };
+		const align = { aligned: true as const, format: "messages" as const, mainLen: mainMsgs.length, forkLen: forkMsgs.length, lead, common };
 		if (common === 0) return { payload: { ...main, messages: forkMsgs }, align };
 		const head = mainMsgs.slice(0, same);
 		if (same < mainMsgs.length) {
 			// Main's marker fell outside the match: put the same marker on the last
 			// matching message so Anthropic can still look back to main's cache.
-			const marker = findMarker(mainMsgs) ?? { type: "ephemeral" };
+			let marker: object | undefined;
+			for (let i = mainMsgs.length - 1; i >= 0 && !marker; i--) {
+				const content = mainMsgs[i].content;
+				if (Array.isArray(content)) marker = content.find((b) => b.cache_control)?.cache_control;
+			}
 			const last = unmark(head[same - 1]);
 			if (Array.isArray(last.content)) {
 				const blocks = last.content.slice();
 				const at = blocks.findLastIndex((b) => b.type !== "thinking" && b.type !== "redacted_thinking");
-				if (at >= 0) blocks[at] = { ...blocks[at], cache_control: marker };
+				if (at >= 0) blocks[at] = { ...blocks[at], cache_control: marker ?? { type: "ephemeral" } };
 				head[same - 1] = { ...last, content: blocks };
 			}
 		}
@@ -661,28 +674,6 @@ export default function (pi: ExtensionAPI) {
 	};
 	const unmark = (m: WireMessage): WireMessage =>
 		Array.isArray(m.content) ? { ...m, content: m.content.map(({ cache_control: _drop, ...b }) => b) } : m;
-	const findMarker = (msgs: WireMessage[]) => {
-		for (let i = msgs.length - 1; i >= 0; i--) {
-			const content = msgs[i].content;
-			if (Array.isArray(content)) for (const b of content) if (b.cache_control) return b.cache_control;
-		}
-		return undefined;
-	};
-	/** How many messages match, once cache markers are ignored, when the fork starts at main[lead]. */
-	const commonFrom = (main: WireMessage[], fork: WireMessage[], lead: number) => {
-		let i = 0;
-		while (lead + i < main.length && i < fork.length && JSON.stringify(unmark(main[lead + i])) === JSON.stringify(fork[i])) i++;
-		return i;
-	};
-	/** The number of messages main has in front of the fork's first message, and how many match from there. */
-	const alignment = (main: WireMessage[], fork: WireMessage[]) => {
-		let best = { lead: 0, common: commonFrom(main, fork, 0) };
-		for (let lead = 1; lead < main.length && best.common < main.length - lead; lead++) {
-			const common = commonFrom(main, fork, lead);
-			if (common > best.common) best = { lead, common };
-		}
-		return best;
-	};
 
 	function relayToParent(n: { line: string; tag: Tag; evidence?: string; explanation?: string; from: string }) {
 		try {
@@ -910,45 +901,44 @@ export default function (pi: ExtensionAPI) {
 	pi.on("agent_before_settle", (e, ctx) => {
 		lastLlmMessages = e.context.llmMessages;
 		if (!state.enabled || ctx.mode !== "tui" || CHILD_INBOX) return;
-		void settleAtEnd(ctx, lastLlmMessages);
-	});
-
-	async function settleAtEnd(ctx: ExtensionContext, messages: Message[]) {
+		const messages = lastLlmMessages;
 		const generation = sessionGeneration, askedAt = promptCounter, turn = turnCount;
-		await inFlightTask;
-		if (generation !== sessionGeneration || askedAt !== promptCounter || turn !== turnCount || !state.enabled ||
-			inFlight || notes.length === 0 || askedAtTurn === turnCount) return;
-		const ac = new AbortController();
-		inFlight = ac;
-		askedAtTurn = turnCount;
-		const waiting = waitingNotes();
-		const t0 = Date.now();
-		let outcome = "error";
-		let extra: CheckDetails = {};
-		inFlightTask = (async () => {
-			try {
-				const { text, ...result } = await fork(ctx, messages, settlePrompt(waiting), ac.signal);
-				extra = result;
-				if (ac.signal.aborted || result.stopReason === "aborted") outcome = "aborted";
-				else if (result.stopReason === "error") outcome = "error";
-				else if (promptCounter !== askedAt || turnCount !== turn) outcome = "stale";
-				else {
-					const settled = parseSettled(text, waiting);
-					extra.settled = settled.length;
-					settle(ctx, settled, "end");
-					outcome = "done";
+		// Do not return this promise: Pi must reach idle while side requests finish.
+		void (async () => {
+			await inFlightTask;
+			if (generation !== sessionGeneration || askedAt !== promptCounter || turn !== turnCount || !state.enabled ||
+				inFlight || notes.length === 0 || askedAtTurn === turnCount) return;
+			const ac = new AbortController();
+			inFlight = ac;
+			askedAtTurn = turnCount;
+			const waiting = waitingNotes();
+			const t0 = Date.now();
+			let outcome = "error";
+			let extra: CheckDetails = {};
+			inFlightTask = (async () => {
+				try {
+					const { text, ...result } = await fork(ctx, messages, settlePrompt(waiting), ac.signal);
+					extra = result;
+					if (ac.signal.aborted || result.stopReason === "aborted") outcome = "aborted";
+					else if (result.stopReason === "error") outcome = "error";
+					else if (promptCounter !== askedAt || turnCount !== turn) outcome = "stale";
+					else {
+						const settled = parseSettled(text, waiting);
+						extra.settled = settled.length;
+						settle(ctx, settled, "end");
+						outcome = "done";
+					}
+				} catch (err) {
+					outcome = ac.signal.aborted ? "aborted" : "error";
+					extra.error = String(err);
+				} finally {
+					if (inFlight === ac) inFlight = undefined;
+					log({ event: "settle", outcome, waiting: waiting.length, ms: Date.now() - t0, ...extra });
+					if (DEBUG) ctx.ui.notify(`you-should-know: settle \u2192 ${outcome}, ${extra.settled ?? 0} of ${waiting.length} (${Date.now() - t0}ms)`, "info");
 				}
-			} catch (err) {
-				outcome = ac.signal.aborted ? "aborted" : "error";
-				extra.error = String(err);
-			} finally {
-				if (inFlight === ac) inFlight = undefined;
-				log({ event: "settle", outcome, waiting: waiting.length, ms: Date.now() - t0, ...extra });
-				if (DEBUG) ctx.ui.notify(`you-should-know: settle \u2192 ${outcome}, ${extra.settled ?? 0} of ${waiting.length} (${Date.now() - t0}ms)`, "info");
-			}
+			})();
 		})();
-		await inFlightTask;
-	}
+	});
 
 	async function showExplanation(ctx: ExtensionContext, n: Note) {
 		let text = n.explanation;
