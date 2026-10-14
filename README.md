@@ -8,12 +8,14 @@ It's a port of the "you should know" plugin built into Claude Code.
 
 ## Using it
 
-- A note shows up above the editor, like `✦ Heads up · The agent loosened the test threshold from 0.8 to 0.65.`
+- A note shows up above the editor, like `✦ Heads up · The agent loosened the test threshold from 0.8 to 0.65.` One note shows at a time. When more are waiting, `2 more waiting` appears under it; click that in fullscreen mode to see them all.
 - `/ysk` or alt+shift+y: open the top note. You can learn more about it, mark it as something you knew, send it to the agent or dismiss it.
 - alt+x: dismiss the top note.
 - In fullscreen mode, click a note to open it under its line. It shows the evidence (a link, when the evidence is a file) and buttons: Explain, Knew it, Ask agent and Dismiss. After Explain, the explanation appears in place with Got it, Simpler, Shorter and More detail. You can keep typing while a note is open. Knew it and Dismiss show Undo for 5 seconds. The open note is the one `/ysk` and alt+x act on. Dragging across a note still selects its text.
 - The explanation screen opened from `/ysk` shows its choices as buttons, which you can click or press the key shown.
 - `/ysk off`, `/ysk on`, `/ysk status`: turn it off and on, or see how many checks it has run.
+
+Notes leave on their own when the agent deals with them. Each later check, and one more when the agent finishes, is asked which waiting notes the agent has since fixed, investigated or told you about; those disappear (the note you have open stays). The checks also skip anything the agent has only just come across, since it usually handles that itself. Up to 5 notes wait at once; while 5 are waiting, new notes are held back until there is room.
 
 If you keep ignoring notes, it checks less often. Answering any note resets that.
 

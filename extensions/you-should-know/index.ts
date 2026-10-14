@@ -28,7 +28,7 @@ const PROMPTS_SURVIVED = 2; // var Tr=2: a note survives this many user prompts
 const MAX_SKIP = 16; // var dt=16
 const FREE_IGNORES = 2; // var ut=2
 const HISTORY_MAX = 50; // var $t=50
-const MAX_NOTES = 5; // local: notes pile up until answered; oldest drops past this
+const MAX_NOTES = 5; // local: notes queue until answered; new notes wait while the queue is full
 const UNDO_MS = 5000; // agent-default (not a user rule): 2026-10-05. How long "Dismissed · Undo" stays after a click.
 const backoff = (ignoredInARow: number) =>
 	ignoredInARow <= FREE_IGNORES ? 0 : Math.min(MAX_SKIP, 2 ** (ignoredInARow - FREE_IGNORES - 1)); // kn()
@@ -60,8 +60,26 @@ const CHILD_NAME = process.env.PI_SUBAGENT_NAME?.trim() || process.env.PI_SUBAGE
 const PREAMBLE = DETECT_TEMPLATE.slice(0, DETECT_TEMPLATE.indexOf("</system-reminder>") + "</system-reminder>".length);
 
 const list = (xs: string[]) => (xs.length > 0 ? xs.map((x) => `- ${x}`).join("\n") : "(nothing yet)"); // ft()
-const detectPrompt = (seen: string[], known: string[]) =>
-	DETECT_TEMPLATE.replace("{{SEEN}}", list(seen)).replace("{{KNOWN}}", list(known)); // dn()
+// ---- local additions: timing, and settling notes the main agent has dealt with ----
+// A check runs every few steps, so it often sees something the agent has only just read and
+// is about to handle itself. Each later check (and one pass when the run ends) is asked which
+// waiting notes the agent has since dealt with, and those leave the screen.
+type Waiting = { label: string; id: string; line: string; age: string };
+const waitingList = (ws: Waiting[]) => ws.map((w) => `- ${w.label} (${w.age}): ${w.line}`).join("\n");
+const TIMING_RULE =
+	"\n\n## Timing\n\nYou are asked after every few steps of the main agent's work, so you will often see something the agent has only just come across. If your topic first appears in the agent's most recent step (for example a tool result it has just read) and the agent has not yet responded to it, answer learn: none. You will be asked again after a few more steps, when you can see whether the agent dealt with it.";
+const SETTLED_RULE =
+	"A waiting note is settled when, after it was raised, the main agent dealt with it: it investigated, fixed or reverted the thing, made a deliberate decision about it, or told the user the same point plainly in its own words. A note is also settled when it is no longer true. Mentioning the topic in passing does not settle it. When unsure, leave the note waiting.";
+const SETTLED_FORMAT = "settled: <labels of the settled notes separated by commas, or none>";
+const detectPrompt = (seen: string[], known: string[], waiting: Waiting[] = [], queueFull = false) =>
+	DETECT_TEMPLATE.replace("{{SEEN}}", list(seen)).replace("{{KNOWN}}", list(known)) + // dn()
+	TIMING_RULE +
+	(waiting.length === 0
+		? ""
+		: `\n\n## Notes already waiting for the user\n\nThese notes are on the user's screen, unanswered:\n${waitingList(waiting)}\n\n${SETTLED_RULE}\n\nBefore the learn line, add one line:\n${SETTLED_FORMAT}` +
+			(queueFull ? "\n\nThe user already has as many waiting notes as they can take, so answer learn: none this time." : ""));
+const settlePrompt = (waiting: Waiting[]) =>
+	`${PREAMBLE}\nAnswer straight away: do not think it over first, do not call any tool.\nThe main agent has just finished its work for now. These notes are waiting for the user, unanswered:\n${waitingList(waiting)}\n\n${SETTLED_RULE}\n\nOutput exactly one line:\n${SETTLED_FORMAT}`;
 
 type Direction = "first" | "simpler_words" | "less_detail" | "more_detail";
 const DIRECTION_ASK: Record<Exclude<Direction, "first">, string> = {
@@ -132,7 +150,7 @@ function log(entry: Record<string, unknown>) {
 
 // ---- output parsing (the CC mod's Cr()) ----
 type Tag = "You should know" | "Heads up";
-type Note = { id: string; line: string; tag: Tag; evidence?: string; explanation?: string; from?: string; shownAt: number; promptsSurvived: number; countedIgnored?: boolean };
+type Note = { id: string; line: string; tag: Tag; evidence?: string; explanation?: string; from?: string; shownAt: number; promptsSurvived: number; countedIgnored?: boolean; step?: number };
 type Parsed = { kind: "none" } | { kind: "parse_failed" } | { kind: "line"; line: string; tag: Tag; evidence?: string; explanation?: string };
 const strip = (s: string) => s.replace(/^[\s>*_`"'\u201C\u201D\u2018\u2019-]+/, "");
 function parse(text: string): Parsed {
@@ -155,6 +173,13 @@ function parse(text: string): Parsed {
 	return { kind: "line", line, tag, evidence, explanation };
 }
 const norm = (s: string) => s.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim(); // Co()
+/** The waiting notes a side answer marks as settled, by their `#n` labels. */
+function parseSettled(text: string, waiting: Waiting[]): string[] {
+	const line = text.split("\n").map(strip).find((l) => /^settled\s*:/i.test(l));
+	if (!line) return [];
+	const labels = new Set([...line.matchAll(/#(\d+)/g)].map((m) => `#${m[1]}`));
+	return waiting.filter((w) => labels.has(w.label)).map((w) => w.id);
+}
 
 // ---- clickable buttons (fullscreen mouse) ----
 type Button<A extends string> = { label: string; action: A; dim?: boolean };
@@ -229,7 +254,7 @@ function linkEvidence(evidence: string, cwd: string) {
 	return `\x1b]8;;${pathToFileURL(file).href}\x1b\\${m[0]}\x1b]8;;\x1b\\${evidence.slice(m[0].length)}`;
 }
 
-type Act = "explain" | "knew" | "ask" | "dismiss" | "got_it" | "simpler_words" | "less_detail" | "more_detail" | "undo";
+type Act = "explain" | "knew" | "ask" | "dismiss" | "got_it" | "simpler_words" | "less_detail" | "more_detail" | "undo" | "more";
 const NOTE_BUTTONS: Button<Act>[] = [
 	{ label: "Explain", action: "explain" },
 	{ label: "Knew it", action: "knew" },
@@ -274,8 +299,15 @@ export default function (pi: ExtensionAPI) {
 	const current = () => notes.find((n) => n.id === expandedId) ?? notes[0];
 	let answered = new Map<string, { note: Note; action: string }>();
 	let inFlight: AbortController | undefined;
+	let inFlightTask: Promise<void> | undefined;
 	let promptCounter = 0; // stands in for CC's turnId staleness check
 	let checks = 0;
+	// Steps seen this process, and the step the last side request looked at. A note remembers
+	// the step it was raised at, so a later request can tell how long it has been waiting.
+	let turnCount = 0;
+	let askedAtTurn = 0;
+	// The terminal widget shows one note; "N more waiting" opens the rest.
+	let showAll = false;
 	const remember = (line: string, known: boolean) => {
 		mkdirSync(dirname(KNOWLEDGE_FILE), { recursive: true });
 		appendFileSync(KNOWLEDGE_FILE, "\n" + JSON.stringify({ line, known }) + "\n");
@@ -304,6 +336,7 @@ export default function (pi: ExtensionAPI) {
 	const render = (ctx: ExtensionContext) => {
 		persistNotes(ctx);
 		if (ctx.mode !== "tui") return;
+		if (notes.length <= 1) showAll = false;
 		if (notes.length === 0 && !undo) {
 			ctx.ui.setWidget(WIDGET, undefined);
 			return;
@@ -311,7 +344,8 @@ export default function (pi: ExtensionAPI) {
 		ctx.ui.setWidget(WIDGET, (_tui, theme) => notesWidget(ctx, theme));
 	};
 
-	// One line per note (no key hint line: alt+x dismisses, /ysk or alt+shift+y responds).
+	// The current note on one line, then "N more waiting" when others are queued; clicking that
+	// shows every note (no key hint line: alt+x dismisses, /ysk or alt+shift+y responds).
 	// In fullscreen mode, clicking a note opens it: evidence, explanation and a row of buttons.
 	type Row = { note?: Note; hits?: Hit<Act>[] };
 	const notesWidget = (ctx: ExtensionContext, theme: any): Component => {
@@ -327,8 +361,8 @@ export default function (pi: ExtensionAPI) {
 					}
 				};
 				const lead = current();
-				const items: (Note | undefined)[] = [...notes];
-				if (undo) items.splice(Math.min(undo.index, items.length), 0, undefined);
+				const items: (Note | undefined)[] = showAll ? [...notes] : lead ? [lead] : [];
+				if (undo) items.splice(showAll ? Math.min(undo.index, items.length) : items.length, 0, undefined);
 				for (const n of items) {
 					if (!n) {
 						const prefix = "  " + theme.fg("dim", `${undo!.action === "knew" ? "Marked as known" : "Dismissed"} \u00b7 `);
@@ -352,6 +386,10 @@ export default function (pi: ExtensionAPI) {
 					}
 					const laid = layoutButtons(v?.md ? EXPLAINED_BUTTONS : NOTE_BUTTONS, width, 2, theme);
 					laid.lines.forEach((l, i) => add([l], { note: n, hits: laid.hits[i] }));
+				}
+				if (notes.length > 1) {
+					const label = showAll ? "Show one" : `${notes.length - 1} more waiting`;
+					add(["  " + theme.fg("dim", label)], { hits: [{ x0: 2, x1: 2 + visibleWidth(label), action: "more" }] });
 				}
 				return lines;
 			},
@@ -421,6 +459,27 @@ export default function (pi: ExtensionAPI) {
 		render(ctx);
 	}
 
+	/** The notes a side request is asked about, labelled `#1`, `#2`... with how long each has waited. */
+	const waitingNotes = (): Waiting[] =>
+		notes.map((n, i) => ({
+			label: `#${i + 1}`,
+			id: n.id,
+			line: n.line,
+			age: n.step === undefined ? "raised in an earlier session" : n.step === turnCount ? "raised just now" : `raised ${turnCount - n.step} steps ago`,
+		}));
+
+	/** The main agent dealt with these notes itself: take them off the screen. The note the user has open stays. */
+	function settle(ctx: ExtensionContext, ids: string[], via: "check" | "end") {
+		const gone = notes.filter((n) => ids.includes(n.id) && n.id !== expandedId);
+		if (gone.length === 0) return;
+		notes = notes.filter((n) => !gone.includes(n));
+		for (const n of gone) {
+			views.delete(n.id);
+			log({ event: "settled", via, line: n.line, msShown: Date.now() - n.shownAt });
+		}
+		render(ctx);
+	}
+
 	function toggle(ctx: ExtensionContext, n: Note) {
 		expandedId = expandedId === n.id ? undefined : n.id;
 		if (expandedId) {
@@ -461,6 +520,10 @@ export default function (pi: ExtensionAPI) {
 
 	async function act(ctx: ExtensionContext, a: Act, n?: Note) {
 		if (a === "undo") return restore(ctx);
+		if (a === "more") {
+			showAll = !showAll;
+			return render(ctx);
+		}
 		if (!n || !notes.includes(n)) return;
 		if (a === "explain") return writeInline(ctx, n, "first");
 		if (a === "simpler_words" || a === "less_detail" || a === "more_detail") return writeInline(ctx, n, a);
@@ -637,13 +700,18 @@ export default function (pi: ExtensionAPI) {
 			const file = notesFile(ctx);
 			if (file) {
 				const saved = JSON.parse(readFileSync(file, "utf8"));
-				notes = saved.notes;
+				// Step numbers belong to the process that raised the note.
+				notes = saved.notes.map(({ step: _step, ...n }: Note) => n);
 				answered = new Map(saved.answered);
 			}
 		} catch (error) {
 			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
 		}
 		promptCounter = 0;
+		turnCount = 0;
+		askedAtTurn = 0;
+		inFlightTask = undefined;
+		showAll = false;
 		render(ctx);
 		if (inboxTimer) clearInterval(inboxTimer);
 		inboxTimer = undefined;
@@ -671,13 +739,15 @@ export default function (pi: ExtensionAPI) {
 
 
 	// A note that survives PROMPTS_SURVIVED user prompts unanswered counts as ignored (for backoff),
-	// but stays on screen so notes can pile up until you answer or dismiss them.
+	// but stays queued until you answer or dismiss it. In the terminal only notes on screen count:
+	// the current one, or all of them while "N more waiting" is open.
 	// Unanswered notes count in RPC clients too. Extension commands are not user prompts.
 	pi.on("input", (e, ctx) => {
 		if (e.source === "extension" || e.text.trim().startsWith("/ysk")) return;
 		promptCounter++;
 		let changed = false;
-		for (const n of notes) {
+		const visible = ctx.mode === "tui" && !showAll ? notes.filter((n) => n === current()) : notes;
+		for (const n of visible) {
 			n.promptsSurvived++;
 			if (n.countedIgnored || n.promptsSurvived < PROMPTS_SURVIVED) continue;
 			n.countedIgnored = true;
@@ -693,6 +763,7 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("turn_end", (e, ctx) => {
 		lastLlmMessages = e.context.llmMessages as any[];
+		turnCount++;
 		if (!state.enabled || !ctx.hasUI) return;
 		const step = e.turnIndex;
 		if (!(step > 0 && step % CHECK_EVERY_STEPS === 0)) return;
@@ -708,23 +779,37 @@ export default function (pi: ExtensionAPI) {
 		const askedAt = promptCounter;
 		const seen = [...state.seen];
 		const known = [...state.known];
+		// RPC clients show and answer notes themselves, so only the terminal settles notes.
+		const waiting = ctx.mode === "tui" ? waitingNotes() : [];
+		const queueFull = ctx.mode === "tui" && notes.length >= MAX_NOTES;
+		const raisedAt = turnCount;
+		askedAtTurn = turnCount;
 		const t0 = Date.now();
 		checks++;
 		// Fire and forget: never block the main agent.
-		void (async () => {
+		inFlightTask = (async () => {
 			let outcome = "error";
 			let extra: Record<string, unknown> = {};
 			try {
-				const r = await fork(ctx, lastLlmMessages, detectPrompt(seen, known), ac.signal);
-				extra = { usage: r.usage, stopReason: r.stopReason };
+				const r = await fork(ctx, lastLlmMessages, detectPrompt(seen, known, waiting, queueFull), ac.signal);
+				extra = { usage: r.usage, stopReason: r.stopReason, waiting: waiting.length };
 				if (ac.signal.aborted) outcome = "aborted";
 				else if (!r.text) outcome = "empty";
 				else {
+					if (waiting.length > 0) {
+						const settled = parseSettled(r.text, waiting);
+						extra.settled = settled.length;
+						settle(ctx, settled, "check");
+					}
 					const p = parse(r.text);
 					if (p.kind !== "line") outcome = p.kind;
 					else if ([...seen, ...known].some((x) => norm(x) === norm(p.line))) outcome = "deduped";
 					else if (promptCounter !== askedAt) outcome = "stale";
-					else {
+					else if (ctx.mode === "tui" && !CHILD_INBOX && notes.length >= MAX_NOTES) {
+						// Not added to seen, so a later check can raise it once there is room.
+						outcome = "queue_full";
+						extra.line = p.line;
+					} else {
 						outcome = "shown";
 						extra.line = p.line;
 						state.seen = [...state.seen, p.line].slice(-HISTORY_MAX);
@@ -742,7 +827,7 @@ export default function (pi: ExtensionAPI) {
 							outcome = "relayed";
 							return;
 						}
-						const note: Note = { id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6), line: p.line, tag: p.tag, evidence: p.evidence, explanation: p.explanation, shownAt: Date.now(), promptsSurvived: 0 };
+						const note: Note = { id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6), line: p.line, tag: p.tag, evidence: p.evidence, explanation: p.explanation, shownAt: Date.now(), promptsSurvived: 0, step: raisedAt };
 						if (ctx.mode !== "tui" && !note.explanation) {
 							// The client's "Explain" has nothing to ask, so write the explanation now.
 							try {
@@ -750,7 +835,6 @@ export default function (pi: ExtensionAPI) {
 							} catch {}
 						}
 						notes.push(note);
-						while (ctx.mode === "tui" && notes.length > MAX_NOTES) log({ event: "overflow_dropped", line: notes.shift()!.line });
 						render(ctx);
 						if (ctx.mode !== "tui") announce(ctx, note);
 					}
@@ -765,6 +849,47 @@ export default function (pi: ExtensionAPI) {
 			}
 		})();
 	});
+
+	// When the run ends, ask once more which waiting notes the agent has since dealt with,
+	// unless the last check already saw the final step. A check still running finishes first.
+	pi.on("agent_before_settle", (e, ctx) => {
+		lastLlmMessages = e.context.llmMessages as any[];
+		if (!state.enabled || ctx.mode !== "tui" || CHILD_INBOX || notes.length === 0 || askedAtTurn === turnCount) return;
+		void settleAtEnd(ctx, lastLlmMessages);
+	});
+
+	async function settleAtEnd(ctx: ExtensionContext, messages: any[]) {
+		await inFlightTask;
+		if (inFlight || notes.length === 0 || askedAtTurn === turnCount) return;
+		const ac = new AbortController();
+		inFlight = ac;
+		askedAtTurn = turnCount;
+		const waiting = waitingNotes();
+		const t0 = Date.now();
+		let outcome = "error";
+		let extra: Record<string, unknown> = {};
+		inFlightTask = (async () => {
+			try {
+				const r = await fork(ctx, messages, settlePrompt(waiting), ac.signal);
+				extra = { usage: r.usage, stopReason: r.stopReason };
+				if (ac.signal.aborted) outcome = "aborted";
+				else {
+					const settled = parseSettled(r.text, waiting);
+					extra.settled = settled.length;
+					settle(ctx, settled, "end");
+					outcome = "done";
+				}
+			} catch (err) {
+				outcome = ac.signal.aborted ? "aborted" : "error";
+				extra.error = String(err);
+			} finally {
+				if (inFlight === ac) inFlight = undefined;
+				log({ event: "settle", outcome, waiting: waiting.length, ms: Date.now() - t0, align: lastAlign, ...extra });
+				if (DEBUG) ctx.ui.notify(`you-should-know: settle \u2192 ${outcome}, ${extra.settled ?? 0} of ${waiting.length} (${Date.now() - t0}ms)`, "info");
+			}
+		})();
+		await inFlightTask;
+	}
 
 	async function showExplanation(ctx: ExtensionContext, n: Note) {
 		let text = n.explanation;
