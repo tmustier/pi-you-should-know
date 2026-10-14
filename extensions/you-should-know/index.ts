@@ -1,9 +1,10 @@
 // You Should Know: a port of Claude Code's built-in `cc-plugin-you-should-know` mod (v2.1.287).
 //
-// Every 6th turn of an agent run, fork the live conversation (same model, same cached prefix,
-// via turn_end's `context.llmMessages`), append the original detect prompt, and ask whether
+// Every 6th turn of an agent run, fork the live conversation via turn_end's
+// `context.llmMessages`, select a side model, append the detect prompt and ask whether
 // there's something the user should know but probably missed. Most of the time the answer is
 // `learn: none`. When it isn't, show a note above the editor. Respond with /ysk (or alt+shift+y).
+// In fullscreen mode, click a note to open it under its line and answer it with buttons.
 //
 // Reference (extracted from the Claude Code binary): ~/.pi/agent/reference/you-should-know/
 //
@@ -12,13 +13,15 @@
 // explanation, for the client to show and answer itself. The client reports each answer back
 // with `/ysk answer <id> <action>`.
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync, appendFileSync, readdirSync, renameSync, unlinkSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync, appendFileSync, readdirSync, renameSync, unlinkSync, rmSync, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { basename, dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { basename, dirname, isAbsolute, join, resolve } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import type { ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
+import type { Context, Message } from "@earendil-works/pi-ai";
 import { DynamicBorder, getMarkdownTheme } from "@earendil-works/pi-coding-agent";
-import { Container, Markdown, matchesKey, Text } from "@earendil-works/pi-tui";
+import type { Component, TuiMouseEvent } from "@earendil-works/pi-tui";
+import { Container, Markdown, matchesKey, Text, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 
 // ---- constants copied from the CC mod ----
 const CHECK_EVERY_STEPS = 6; // var kr=6
@@ -26,13 +29,15 @@ const PROMPTS_SURVIVED = 2; // var Tr=2: a note survives this many user prompts
 const MAX_SKIP = 16; // var dt=16
 const FREE_IGNORES = 2; // var ut=2
 const HISTORY_MAX = 50; // var $t=50
-const MAX_NOTES = 5; // local: notes pile up until answered; oldest drops past this
+const MAX_NOTES = 5; // local: notes queue until answered; new notes wait while the queue is full
+const UNDO_MS = 5000; // agent-default (not a user rule): 2026-10-05. How long "Dismissed · Undo" stays after a click.
 const backoff = (ignoredInARow: number) =>
 	ignoredInARow <= FREE_IGNORES ? 0 : Math.min(MAX_SKIP, 2 ** (ignoredInARow - FREE_IGNORES - 1)); // kn()
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const DETECT_TEMPLATE = readFileSync(join(HERE, "detect-prompt.md"), "utf8");
 const AGENT_DIR = process.env.PI_CODING_AGENT_DIR?.trim() || join(homedir(), ".pi", "agent");
+const CONFIG_FILE = join(AGENT_DIR, "you-should-know", "config.json");
 const STATE_FILE = join(AGENT_DIR, "you-should-know", "state.json");
 const KNOWLEDGE_FILE = join(AGENT_DIR, "you-should-know", "knowledge.jsonl");
 const LOG_FILE = join(AGENT_DIR, "you-should-know", "checks.jsonl");
@@ -57,8 +62,26 @@ const CHILD_NAME = process.env.PI_SUBAGENT_NAME?.trim() || process.env.PI_SUBAGE
 const PREAMBLE = DETECT_TEMPLATE.slice(0, DETECT_TEMPLATE.indexOf("</system-reminder>") + "</system-reminder>".length);
 
 const list = (xs: string[]) => (xs.length > 0 ? xs.map((x) => `- ${x}`).join("\n") : "(nothing yet)"); // ft()
-const detectPrompt = (seen: string[], known: string[]) =>
-	DETECT_TEMPLATE.replace("{{SEEN}}", list(seen)).replace("{{KNOWN}}", list(known)); // dn()
+// ---- local additions: timing, and settling notes the main agent has dealt with ----
+// A check runs every few steps, so it often sees something the agent has only just read and
+// is about to handle itself. Each later check (and one pass when the run ends) is asked which
+// waiting notes the agent has since dealt with, and those leave the screen.
+type Waiting = { label: string; id: string; line: string; age: string };
+const waitingList = (ws: Waiting[]) => ws.map((w) => `- ${w.label} (${w.age}): ${w.line}`).join("\n");
+const TIMING_RULE =
+	"\n\n## Timing\n\nYou are asked after every few steps of the main agent's work, so you will often see something the agent has only just come across. If your topic first appears in the agent's most recent step (for example a tool result it has just read) and the agent has not yet responded to it, answer learn: none. You will be asked again after a few more steps, when you can see whether the agent dealt with it.";
+const SETTLED_RULE =
+	"A waiting note is settled when, after it was raised, the main agent dealt with it: it investigated, fixed or reverted the thing, made a deliberate decision about it, or told the user the same point plainly in its own words. A note is also settled when it is no longer true. Mentioning the topic in passing does not settle it. When unsure, leave the note waiting.";
+const SETTLED_FORMAT = "settled: <labels of the settled notes separated by commas, or none>";
+const detectPrompt = (seen: string[], known: string[], waiting: Waiting[] = [], queueFull = false) =>
+	DETECT_TEMPLATE.replace("{{SEEN}}", list(seen)).replace("{{KNOWN}}", list(known)) + // dn()
+	TIMING_RULE +
+	(waiting.length === 0
+		? ""
+		: `\n\n## Notes already waiting for the user\n\nThese notes are on the user's screen, unanswered:\n${waitingList(waiting)}\n\n${SETTLED_RULE}\n\nBefore the learn line, add one line:\n${SETTLED_FORMAT}` +
+			(queueFull ? "\n\nThe user already has as many waiting notes as they can take, so answer learn: none this time." : ""));
+const settlePrompt = (waiting: Waiting[]) =>
+	`${PREAMBLE}\nAnswer straight away: do not think it over first, do not call any tool.\nThe main agent has just finished its work for now. These notes are waiting for the user, unanswered:\n${waitingList(waiting)}\n\n${SETTLED_RULE}\n\nOutput exactly one line:\n${SETTLED_FORMAT}`;
 
 type Direction = "first" | "simpler_words" | "less_detail" | "more_detail";
 const DIRECTION_ASK: Record<Exclude<Direction, "first">, string> = {
@@ -129,7 +152,7 @@ function log(entry: Record<string, unknown>) {
 
 // ---- output parsing (the CC mod's Cr()) ----
 type Tag = "You should know" | "Heads up";
-type Note = { id: string; line: string; tag: Tag; evidence?: string; explanation?: string; from?: string; shownAt: number; promptsSurvived: number; countedIgnored?: boolean };
+type Note = { id: string; line: string; tag: Tag; evidence?: string; explanation?: string; from?: string; shownAt: number; promptsSurvived: number; countedIgnored?: boolean; step?: number };
 type Parsed = { kind: "none" } | { kind: "parse_failed" } | { kind: "line"; line: string; tag: Tag; evidence?: string; explanation?: string };
 const strip = (s: string) => s.replace(/^[\s>*_`"'\u201C\u201D\u2018\u2019-]+/, "");
 function parse(text: string): Parsed {
@@ -152,37 +175,182 @@ function parse(text: string): Parsed {
 	return { kind: "line", line, tag, evidence, explanation };
 }
 const norm = (s: string) => s.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim(); // Co()
+/** The waiting notes a side answer marks as settled, by their `#n` labels. */
+function parseSettled(text: string, waiting: Waiting[]): string[] {
+	const line = text.split("\n").map(strip).find((l) => /^settled\s*:/i.test(l));
+	if (!line) return [];
+	const labels = new Set([...line.matchAll(/#(\d+)/g)].map((m) => `#${m[1]}`));
+	return waiting.filter((w) => labels.has(w.label)).map((w) => w.id);
+}
 
-const textOf = (msg: { content: unknown }) =>
-	Array.isArray(msg.content)
-		? msg.content
-				.filter((c: any) => c?.type === "text" && typeof c.text === "string")
-				.map((c: any) => c.text)
-				.join("\n")
-				.trim()
-		: "";
+// ---- clickable buttons (fullscreen mouse) ----
+type Button<A extends string> = { label: string; action: A; dim?: boolean };
+type Hit<A extends string> = { x0: number; x1: number; action: A };
+/** Lays buttons out left to right after `indent` columns, wrapping when they do not fit, and records where each one landed. */
+function layoutButtons<A extends string>(buttons: Button<A>[], width: number, indent: number, theme: Theme) {
+	const lines: string[] = [];
+	const hits: Hit<A>[][] = [];
+	let line = " ".repeat(indent);
+	let x = indent;
+	let row: Hit<A>[] = [];
+	for (const b of buttons) {
+		const text = `[${b.label}]`;
+		const w = visibleWidth(text);
+		if (row.length > 0 && x + 2 + w > width) {
+			lines.push(truncateToWidth(line, width, ""));
+			hits.push(row);
+			line = " ".repeat(indent);
+			x = indent;
+			row = [];
+		}
+		if (row.length > 0) {
+			line += "  ";
+			x += 2;
+		}
+		row.push({ x0: x, x1: x + w, action: b.action });
+		line += theme.fg(b.dim ? "dim" : "accent", text);
+		x += w;
+	}
+	lines.push(truncateToWidth(line, width, ""));
+	hits.push(row);
+	return { lines, hits };
+}
+/** The button under a left click, if any. Presses and drags are left alone so text selection keeps working. */
+const clicked = <A extends string>(row: Hit<A>[] | undefined, e: TuiMouseEvent) =>
+	e.type === "click" && e.button === "left" ? row?.find((h) => e.x >= h.x0 && e.x < h.x1)?.action : undefined;
+class ButtonRow<A extends string> implements Component {
+	private hits: Hit<A>[][] = [];
+	private buttons: Button<A>[];
+	private theme: Theme;
+	private onPress: (action: A) => void;
+	constructor(buttons: Button<A>[], theme: Theme, onPress: (action: A) => void) {
+		this.buttons = buttons;
+		this.theme = theme;
+		this.onPress = onPress;
+	}
+	render(width: number) {
+		const laid = layoutButtons(this.buttons, width, 1, this.theme);
+		this.hits = laid.hits;
+		return laid.lines;
+	}
+	handleMouse(e: TuiMouseEvent) {
+		const action = clicked(this.hits[e.y], e);
+		if (!action) return undefined;
+		this.onPress(action);
+		return { handled: true };
+	}
+	invalidate() {}
+}
+
+/** Evidence that starts with an existing file (`src/a.ts:12 ...`) gets a terminal link to that file. */
+function linkEvidence(evidence: string, cwd: string) {
+	const m = /^([^\s,;()]+?)(:\d+(?:[:-]\d+)?)?(?=$|[\s,;)])/.exec(evidence);
+	if (!m) return evidence;
+	const path = m[1].replace(/^~(?=\/)/, homedir());
+	const file = isAbsolute(path) ? path : resolve(cwd, path);
+	try {
+		if (!statSync(file).isFile()) return evidence;
+	} catch {
+		return evidence;
+	}
+	return `\x1b]8;;${pathToFileURL(file).href}\x1b\\${m[0]}\x1b]8;;\x1b\\${evidence.slice(m[0].length)}`;
+}
+
+type Act = "explain" | "knew" | "ask" | "dismiss" | "got_it" | "simpler_words" | "less_detail" | "more_detail" | "undo" | "more";
+const NOTE_BUTTONS: Button<Act>[] = [
+	{ label: "Explain", action: "explain" },
+	{ label: "Knew it", action: "knew" },
+	{ label: "Ask agent", action: "ask" },
+	{ label: "Dismiss", action: "dismiss", dim: true },
+];
+const EXPLAINED_BUTTONS: Button<Act>[] = [
+	{ label: "Got it", action: "got_it" },
+	{ label: "Ask agent", action: "ask" },
+	{ label: "Simpler", action: "simpler_words" },
+	{ label: "Shorter", action: "less_detail" },
+	{ label: "More detail", action: "more_detail" },
+	{ label: "Dismiss", action: "dismiss", dim: true },
+];
+// The keyboard explanation screen: the same choices, labelled with their keys.
+const EXPLAIN_SCREEN_BUTTONS: Button<string>[] = [
+	{ label: "1 Got it", action: "understood" },
+	{ label: "2 Ask agent", action: "chat" },
+	{ label: "s Simpler", action: "simpler_words" },
+	{ label: "l Shorter", action: "less_detail" },
+	{ label: "m More detail", action: "more_detail" },
+	{ label: "0 Dismiss", action: "dismiss", dim: true },
+];
+
+// Provider payloads keep their other fields when spread; only these fields are inspected.
+type WireBlock = { type: string; cache_control?: object };
+type WireMessage = { content?: string | WireBlock[] | null };
+type Payload = { model: string; messages?: WireMessage[]; input?: unknown[] };
+const isObject = (value: unknown): value is Record<string, unknown> => value !== null && typeof value === "object";
+function payload(value: unknown): Payload | undefined {
+	if (!isObject(value) || typeof value.model !== "string") return;
+	if (Array.isArray(value.input)) return value as Payload;
+	if (Array.isArray(value.messages) && value.messages.every((m: unknown) => isObject(m) &&
+		(m.content == null || typeof m.content === "string" || Array.isArray(m.content) &&
+			m.content.every((b: unknown) => isObject(b) && typeof b.type === "string")))) return value as Payload;
+}
+type Aligned =
+	| { align: { aligned: false; why: string }; payload?: never; copiedMain?: never }
+	| { align: { aligned: true } & (
+		{ format: "messages"; mainLen: number; forkLen: number; lead: number; common: number } |
+		{ format: "responses" }
+	); payload: Payload; copiedMain?: Payload };
 
 export default function (pi: ExtensionAPI) {
 	let state = loadState();
-	let notes: Note[] = []; // oldest first; notes[0] is the one /ysk and alt+x act on
+	let notes: Note[] = []; // oldest first; /ysk and alt+x act on current(): the open note, else notes[0]
+	// Fullscreen mouse: which note is open under its line, its explanation, and the last undoable answer.
+	let expandedId: string | undefined;
+	type View = { text?: string; md?: Markdown; writing?: boolean; error?: string };
+	const views = new Map<string, View>();
+	let undo: { note: Note; index: number; action: "knew" | "dismiss"; timer: ReturnType<typeof setTimeout> } | undefined;
+	const current = () => notes.find((n) => n.id === expandedId) ?? notes[0];
 	let answered = new Map<string, { note: Note; action: string }>();
 	let inFlight: AbortController | undefined;
+	let inFlightTask: Promise<void> | undefined;
 	let promptCounter = 0; // stands in for CC's turnId staleness check
+	let sessionGeneration = 0;
 	let checks = 0;
+	// Steps seen this process, and the step the last side request looked at. A note remembers
+	// the step it was raised at, so a later request can tell how long it has been waiting.
+	let turnCount = 0;
+	let askedAtTurn = 0;
+	// The terminal widget shows one note; "N more waiting" opens the rest.
+	let showAll = false;
 	const remember = (line: string, known: boolean) => {
 		mkdirSync(dirname(KNOWLEDGE_FILE), { recursive: true });
 		appendFileSync(KNOWLEDGE_FILE, "\n" + JSON.stringify({ line, known }) + "\n");
 		state.known = readKnowledge(state.known);
 	};
 
+	// Same model and thinking reuse main's cache; explicit routes retain their provider.
+	const thinkingLevels = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
+	const isMain = (ctx: ExtensionContext, model: { provider: string; id: string } | undefined) =>
+		!!model && model.provider === ctx.model?.provider && model.id === ctx.model?.id;
 	const pickModel = (ctx: ExtensionContext) => {
-		const o = process.env.YSK_MODEL; // optional override: provider/model-id
-		if (o && o.includes("/")) {
-			const i = o.indexOf("/");
-			const m = ctx.modelRegistry.find(o.slice(0, i), o.slice(i + 1));
-			if (m) return m;
-		}
-		return ctx.model; // CC uses the main session's model (JR() -> mainLoopModel)
+		const id = ctx.model?.id.split("/").at(-1) ?? "";
+		const family = /^gpt-/i.test(id) ? "gpt" : /^claude-fable(?:-|$)/i.test(id) ? "fable" : undefined;
+		const config: unknown = existsSync(CONFIG_FILE) ? JSON.parse(readFileSync(CONFIG_FILE, "utf8")) : {};
+		if (!isObject(config)) throw new Error("Invalid YSK config: " + CONFIG_FILE);
+		const route = family ? config[family] : undefined;
+		if (route !== undefined && !isObject(route)) throw new Error("Invalid YSK route: " + CONFIG_FILE);
+		const level = route?.thinking;
+		const thinking = thinkingLevels.find((value) => value === level);
+		if (level !== undefined && thinking === undefined) throw new Error("Invalid YSK thinking level in " + CONFIG_FILE);
+		const override = process.env.YSK_MODEL?.trim();
+		if (!override && !route) return { model: ctx.model, thinking: undefined };
+		const requested = override || route?.model || (ctx.model && `${ctx.model.provider}/${ctx.model.id}`);
+		if (typeof requested !== "string" || !requested.includes("/")) throw new Error("YSK model must be provider/model-id");
+		const at = requested.indexOf("/");
+		const model = ctx.modelRegistry.find(requested.slice(0, at), requested.slice(at + 1));
+		if (!model) throw new Error(`YSK model not found: ${requested}`);
+		// A route to the main model at the main level is the cached same-model request.
+		if (isMain(ctx, model) && (thinking === undefined || thinking === pi.getThinkingLevel())) return { model, thinking: undefined };
+		return { model, thinking };
 	};
 
 	const notesFile = (ctx: ExtensionContext) =>
@@ -197,130 +365,315 @@ export default function (pi: ExtensionAPI) {
 	const render = (ctx: ExtensionContext) => {
 		persistNotes(ctx);
 		if (ctx.mode !== "tui") return;
-		if (notes.length === 0) {
+		if (notes.length <= 1) showAll = false;
+		if (notes.length === 0 && !undo) {
 			ctx.ui.setWidget(WIDGET, undefined);
 			return;
 		}
-		const shown = [...notes];
-		ctx.ui.setWidget(WIDGET, (_tui, theme) => {
-			const c = new Container();
-			shown.forEach((n, i) => {
-				const mark = i === 0 ? theme.fg("accent", "\u2726 ") : theme.fg("dim", "\u2727 ");
-				const tag = i === 0 ? theme.fg("accent", theme.bold(n.tag)) : theme.fg("dim", n.tag);
-				const from = n.from ? theme.fg("dim", ` (${n.from})`) : "";
-				c.addChild(new Text(mark + tag + from + theme.fg("dim", " \u00b7 ") + n.line, 0, 0));
-			});
-			return c;  // (no key hint line: alt+x dismisses, /ysk or alt+shift+y responds)
-		});
+		ctx.ui.setWidget(WIDGET, (_tui, theme) => notesWidget(ctx, theme));
+	};
+
+	// The current note on one line, then "N more waiting" when others are queued; clicking that
+	// shows every note (no key hint line: alt+x dismisses, /ysk or alt+shift+y responds).
+	// In fullscreen mode, clicking a note opens it: evidence, explanation and a row of buttons.
+	type Row = { note?: Note; hits?: Hit<Act>[] };
+	const notesWidget = (ctx: ExtensionContext, theme: Theme): Component => {
+		let rows: Row[] = [];
+		return {
+			render(width: number) {
+				const lines: string[] = [];
+				rows = [];
+				const add = (ls: string[], row: Row) => {
+					for (const l of ls) {
+						lines.push(truncateToWidth(l, width, ""));
+						rows.push(row);
+					}
+				};
+				const lead = current();
+				const items: (Note | undefined)[] = showAll ? [...notes] : lead ? [lead] : [];
+				if (undo) items.splice(showAll ? Math.min(undo.index, items.length) : items.length, 0, undefined);
+				for (const n of items) {
+					if (!n) {
+						const prefix = "  " + theme.fg("dim", `${undo!.action === "knew" ? "Marked as known" : "Dismissed"} \u00b7 `);
+						const x0 = visibleWidth(prefix);
+						add([prefix + theme.fg("accent", "Undo")], { hits: [{ x0, x1: x0 + 4, action: "undo" }] });
+						continue;
+					}
+					const on = n === lead;
+					const mark = on ? theme.fg("accent", "\u2726 ") : theme.fg("dim", "\u2727 ");
+					const tag = on ? theme.fg("accent", theme.bold(n.tag)) : theme.fg("dim", n.tag);
+					const from = n.from ? theme.fg("dim", ` (${n.from})`) : "";
+					add(wrapTextWithAnsi(mark + tag + from + theme.fg("dim", " \u00b7 ") + n.line, width), { note: n });
+					if (n.id !== expandedId) continue;
+					if (n.evidence) add(wrapTextWithAnsi("  " + theme.fg("dim", "Evidence: ") + linkEvidence(n.evidence, ctx.cwd), width), {});
+					const v = views.get(n.id);
+					if (v?.md) add(v.md.render(width), {});
+					if (v?.error) add(wrapTextWithAnsi("  " + theme.fg("error", v.error), width), {});
+					if (v?.writing) {
+						add(["  " + theme.fg("dim", "Writing\u2026")], {});
+						continue;
+					}
+					const laid = layoutButtons(v?.md ? EXPLAINED_BUTTONS : NOTE_BUTTONS, width, 2, theme);
+					laid.lines.forEach((l, i) => add([l], { note: n, hits: laid.hits[i] }));
+				}
+				if (notes.length > 1) {
+					const label = showAll ? "Show one" : `${notes.length - 1} more waiting`;
+					add(["  " + theme.fg("dim", label)], { hits: [{ x0: 2, x1: 2 + visibleWidth(label), action: "more" }] });
+				}
+				return lines;
+			},
+			handleMouse(e: TuiMouseEvent) {
+				const row = rows[e.y];
+				if (!row) return undefined;
+				const action = clicked(row.hits, e);
+				if (action) {
+					void act(ctx, action, row.note);
+					return { handled: true };
+				}
+				if (row.note && !row.hits && e.type === "click" && e.button === "left") {
+					toggle(ctx, row.note);
+					return { handled: true };
+				}
+				return undefined;
+			},
+			invalidate() {
+				for (const v of views.values()) v.md?.invalidate();
+			},
+		};
 	};
 
 	const clearNotes = (ctx: ExtensionContext) => {
 		notes = [];
+		expandedId = undefined;
+		views.clear();
 		render(ctx);
 	};
 
-	const popNote = (ctx: ExtensionContext) => {
-		const n = notes.shift();
-		render(ctx);
-		return n;
+	// Any answer, or opening a note, counts as paying attention: checks go back to full frequency.
+	const engage = () => {
+		state.ignoredInARow = 0;
+		state.skip = 0;
+		saveState(state);
 	};
 
-	async function fork(ctx: ExtensionContext, llmMessages: any[], prompt: string, signal: AbortSignal) {
-		const model = pickModel(ctx);
+	/** Take a note off the list. Mouse answers that lose something (knew, dismiss) can be undone for a few seconds. */
+	function removeNote(ctx: ExtensionContext, n: Note, undoable?: "knew" | "dismiss") {
+		const index = notes.indexOf(n);
+		notes = notes.filter((x) => x !== n);
+		views.delete(n.id);
+		if (expandedId === n.id) expandedId = undefined;
+		if (undo) clearTimeout(undo.timer);
+		undo = undefined;
+		if (undoable) {
+			const timer = setTimeout(() => {
+				if (undo?.timer !== timer) return;
+				undo = undefined;
+				render(ctx);
+			}, UNDO_MS);
+			timer.unref?.();
+			undo = { note: n, index, action: undoable, timer };
+		}
+		engage();
+		render(ctx);
+	}
+
+	function restore(ctx: ExtensionContext) {
+		if (!undo) return;
+		const { note, index, action, timer } = undo;
+		clearTimeout(timer);
+		undo = undefined;
+		notes.splice(Math.min(index, notes.length), 0, note);
+		if (action === "knew") remember(note.line, false);
+		log({ event: "undo", answer: action, via: "mouse", line: note.line });
+		render(ctx);
+	}
+
+	/** The notes a side request is asked about, labelled `#1`, `#2`... with how long each has waited. */
+	const waitingNotes = (): Waiting[] =>
+		notes.map((n, i) => ({
+			label: `#${i + 1}`,
+			id: n.id,
+			line: n.line,
+			age: n.step === undefined ? "raised in an earlier session" : n.step === turnCount ? "raised just now" : `raised ${turnCount - n.step} steps ago`,
+		}));
+
+	/** The main agent dealt with these notes itself: take them off the screen. The note the user has open stays. */
+	function settle(ctx: ExtensionContext, ids: string[], via: "check" | "end") {
+		const gone = notes.filter((n) => ids.includes(n.id) && n.id !== expandedId);
+		if (gone.length === 0) return;
+		notes = notes.filter((n) => !gone.includes(n));
+		for (const n of gone) {
+			views.delete(n.id);
+			log({ event: "settled", via, line: n.line, msShown: Date.now() - n.shownAt });
+		}
+		render(ctx);
+	}
+
+	function toggle(ctx: ExtensionContext, n: Note) {
+		expandedId = expandedId === n.id ? undefined : n.id;
+		if (expandedId) {
+			engage();
+			log({ event: "expand", via: "mouse", line: n.line, msToAnswer: Date.now() - n.shownAt });
+		}
+		render(ctx);
+	}
+
+	/** Explain a note under its line, or rewrite the explanation already there. */
+	async function writeInline(ctx: ExtensionContext, n: Note, direction: Direction) {
+		const v: View = views.get(n.id) ?? {};
+		views.set(n.id, v);
+		if (v.writing) return;
+		const show = (text: string) => {
+			v.text = text;
+			v.md = new Markdown(text, 2, 0, getMarkdownTheme());
+		};
+		if (direction === "first" && n.explanation) {
+			show(n.explanation);
+			render(ctx);
+			return;
+		}
+		v.writing = true;
+		v.error = undefined;
+		render(ctx);
+		try {
+			const prev = direction !== "first" && v.text ? { direction, text: v.text } : undefined;
+			const r = await fork(ctx, lastLlmMessages, explainPrompt(n.line, prev), new AbortController().signal);
+			if (r.text) show(r.text);
+			else v.error = "No explanation came back.";
+		} catch (err) {
+			v.error = `Couldn\u2019t write that explanation: ${err}`;
+		}
+		v.writing = false;
+		if (views.get(n.id) === v) render(ctx); // the note may have been answered meanwhile
+	}
+
+	async function act(ctx: ExtensionContext, a: Act, n?: Note) {
+		if (a === "undo") return restore(ctx);
+		if (a === "more") {
+			showAll = !showAll;
+			return render(ctx);
+		}
+		if (!n || !notes.includes(n)) return;
+		if (a === "explain") return writeInline(ctx, n, "first");
+		if (a === "simpler_words" || a === "less_detail" || a === "more_detail") return writeInline(ctx, n, a);
+		const explanation = views.get(n.id)?.text;
+		removeNote(ctx, n, a === "knew" || a === "dismiss" ? a : undefined);
+		if (a === "knew") remember(n.line, true);
+		if (a === "ask") chatInMain(n, explanation ?? n.explanation);
+		const answer = { knew: "knew", dismiss: "dismiss", ask: "chat", got_it: "understood" }[a];
+		log({ event: "answer", answer, via: "mouse", explained: !!explanation, line: n.line, msToAnswer: Date.now() - n.shownAt });
+	}
+
+	async function fork(ctx: ExtensionContext, llmMessages: Message[], prompt: string, signal: AbortSignal) {
+		const { model, thinking } = pickModel(ctx);
 		if (!model) throw new Error("no model");
+		const same = isMain(ctx, model) && thinking === undefined;
 		const messages = [
 			...llmMessages,
 			{ role: "user" as const, content: [{ type: "text" as const, text: prompt }], timestamp: Date.now() },
 		];
 		const hasSystem = llmMessages[0]?.role === "system";
-		const res = await ctx.modelRegistry.complete(
-			model,
-			{ messages, ...(hasSystem ? {} : { systemPrompt: ctx.getSystemPrompt() }) } as any,
-			{ signal, sessionId: ctx.sessionManager.getSessionId(), onPayload: (p: unknown) => alignWithMain(p) } as any,
-		);
-		return { text: textOf(res as any), usage: (res as any).usage, stopReason: (res as any).stopReason };
+		const context: Context = { messages, ...(hasSystem ? {} : { systemPrompt: ctx.getSystemPrompt() }) };
+		let aligned: Aligned | undefined;
+		const options = {
+			signal, sessionId: ctx.sessionManager.getSessionId(),
+			onPayload: (p: unknown) => {
+				// Cache alignment copies the main request (tools, system, thinking), so it must
+				// not overwrite a routed model's converted history or its own thinking setting.
+				if (same) aligned = alignWithMain(payload(p));
+				const sent = aligned?.payload ?? p;
+				if (isObject(sent)) forkPayloads.add(sent);
+				return aligned?.payload;
+			},
+		};
+		// The same-model request reuses the main request's payload. Routes use Pi's neutral
+		// thinking option, translated by each provider to its native wire format.
+		const res = same
+			? await ctx.modelRegistry.complete(model, context, options)
+			: await ctx.modelRegistry.streamSimple(model, context, { ...options, reasoning: thinking === "off" ? undefined : thinking, toolChoice: "none" }).result();
+		let cache: { read: number; expected: number; ok: boolean } | undefined;
+		const expected = aligned?.copiedMain && cachedByMain.get(aligned.copiedMain);
+		if (DEBUG && res.stopReason !== "error" && expected) {
+			const read = res.usage.cacheRead;
+			cache = { read, expected, ok: read >= expected };
+			if (!cache.ok) ctx.ui.notify(
+				`you-should-know: a check read ${read} tokens from cache, fewer than the ${expected} the main request had there. Another extension may change requests after this one copies them.`,
+				"warning",
+			);
+		}
+		const text = res.content.filter((c) => c.type === "text").map((c) => c.text).join("\n").trim();
+		const align = aligned?.align ?? { aligned: false as const, why: "independent side request" };
+		return { text, usage: res.usage, stopReason: res.stopReason, error: res.errorMessage, provider: model.provider, model: model.id, thinking, cache, align };
 	}
 
-	let lastLlmMessages: any[] = [];
+	let lastLlmMessages: Message[] = [];
 
-	/**
-	 * The main conversation's last request, exactly as sent. The fork is only
-	 * cheap if its bytes start the same way, and they did not: it sent no tools
-	 * and no thinking setting, so Anthropic kept the tools and system prompt
-	 * cached but wrote every message again — about 255k tokens and $1.30 per
-	 * check on Opus 5.5 (155 checks, $56.76 in checks.jsonl before this fix).
-	 */
-	let mainPayload: Record<string, unknown> | undefined;
+	type CheckDetails = Partial<Omit<Awaited<ReturnType<typeof fork>>, "text">> & { waiting?: number; settled?: number; line?: string };
+	// Preserve tools, system and thinking as well as messages for cache reuse.
+	let mainPayload: Payload | undefined;
 	const forkPayloads = new WeakSet<object>();
 	pi.on("before_provider_request", (e) => {
 		const p = e.payload;
-		if (!p || typeof p !== "object" || forkPayloads.has(p as object)) return; // never align to our own fork
-		mainPayload = p as Record<string, unknown>;
+		if (isObject(p) && forkPayloads.has(p)) return;
+		mainPayload = payload(p);
 	});
 
-	/** How the last fork lined up with the main request; logged with each check. */
-	let lastAlign: Record<string, unknown> = {};
+	// Compare cache usage only when the fork retained the entire main prefix.
+	const cachedByMain = new WeakMap<object, number>();
+	pi.on("message_end", (e) => {
+		const usage = e.message.role === "assistant" ? e.message.usage : undefined;
+		if (DEBUG && usage && mainPayload) cachedByMain.set(mainPayload, usage.cacheRead + usage.cacheWrite);
+	});
 
-	/**
-	 * Cache fix, take two. The first version rebuilt the fork's messages and moved
-	 * the cache marker to the message before the detect prompt. Anthropic only finds
-	 * a cached prefix by looking back about 20 content blocks from a marker, and
-	 * most checks landed outside that window: checks.jsonl showed ~21k tokens read
-	 * (tools + system only) and 130-300k written, about $1 per check.
-	 *
-	 * Now the fork reuses the main request's message list byte for byte, including
-	 * its cache marker, so the fork reads exactly what the main request cached. The
-	 * messages after it (the turn that just ended) and the detect prompt carry no
-	 * marker: they are paid once as plain input and never written to the cache.
-	 */
-	const alignWithMain = (forked: unknown): unknown => {
+	// Keep main's cache markers: moving them beyond Anthropic's lookback window loses
+	// the cached prefix. New messages and the side prompt remain unmarked.
+	const alignWithMain = (f: Payload | undefined): Aligned => {
 		const main = mainPayload;
-		lastAlign = { aligned: false };
-		if (!main || !forked || typeof forked !== "object") return markFork(undefined, (lastAlign.why = "no main payload"));
-		const f = forked as Record<string, unknown>;
-		if (main["model"] !== f["model"]) return markFork(undefined, (lastAlign.why = "model differs"));
-		const key = Array.isArray(f["messages"]) ? "messages" : Array.isArray(f["input"]) ? "input" : undefined;
-		if (!key || !Array.isArray(main[key])) return markFork(undefined, (lastAlign.why = "no message list"));
-		if (key === "input") return markFork({ ...main, input: f["input"] }, undefined, true);
-		const mainMsgs = main[key] as any[];
-		const forkMsgs = (f[key] as any[]).map(unmark);
-		const same = commonPrefix(mainMsgs, forkMsgs);
-		lastAlign = { aligned: true, mainLen: mainMsgs.length, forkLen: forkMsgs.length, common: same };
-		if (same === 0) return markFork({ ...main, messages: forkMsgs }, undefined, true);
+		if (!main || !f) return { align: { aligned: false, why: "no main payload" } };
+		if (main.model !== f.model) return { align: { aligned: false, why: "model differs" } };
+		if (main.input && f.input) return {
+			payload: { ...main, input: f.input }, align: { aligned: true, format: "responses" },
+			copiedMain: JSON.stringify(main.input) === JSON.stringify(f.input.slice(0, main.input.length)) ? main : undefined,
+		};
+		if (!main.messages || !f.messages) return { align: { aligned: false, why: "no message list" } };
+		const mainMsgs = main.messages;
+		const forkMsgs = f.messages.map(unmark);
+		// Another extension may put messages in front of the main request after Pi builds it (the
+		// Anthropic OAuth fix moves the system prompt into a leading user message), so the fork's
+		// first message can match a later one in main. Main's leading messages are kept as sent.
+		let lead = 0, common = 0;
+		for (let start = 0; start < mainMsgs.length && common < mainMsgs.length - start; start++) {
+			let matched = 0;
+			while (start + matched < mainMsgs.length && matched < forkMsgs.length &&
+				JSON.stringify(unmark(mainMsgs[start + matched])) === JSON.stringify(forkMsgs[matched])) matched++;
+			if (matched > common) { lead = start; common = matched; }
+		}
+		const same = lead + common;
+		const align = { aligned: true as const, format: "messages" as const, mainLen: mainMsgs.length, forkLen: forkMsgs.length, lead, common };
+		if (common === 0) return { payload: { ...main, messages: forkMsgs }, align };
 		const head = mainMsgs.slice(0, same);
 		if (same < mainMsgs.length) {
 			// Main's marker fell outside the match: put the same marker on the last
 			// matching message so Anthropic can still look back to main's cache.
-			const marker = findMarker(mainMsgs) ?? { type: "ephemeral" };
+			let marker: object | undefined;
+			for (let i = mainMsgs.length - 1; i >= 0 && !marker; i--) {
+				const content = mainMsgs[i].content;
+				if (Array.isArray(content)) marker = content.find((b) => b.cache_control)?.cache_control;
+			}
 			const last = unmark(head[same - 1]);
-			if (Array.isArray(last?.content) && last.content.length > 0) {
+			if (Array.isArray(last.content)) {
 				const blocks = last.content.slice();
-				const at = blocks.findLastIndex((b: any) => b?.type !== "thinking" && b?.type !== "redacted_thinking");
-				if (at >= 0) blocks[at] = { ...blocks[at], cache_control: marker };
+				const at = blocks.findLastIndex((b) => b.type !== "thinking" && b.type !== "redacted_thinking");
+				if (at >= 0) blocks[at] = { ...blocks[at], cache_control: marker ?? { type: "ephemeral" } };
 				head[same - 1] = { ...last, content: blocks };
 			}
 		}
 		// Main's own messages (marker included), then the new tail, unmarked.
-		return markFork({ ...main, messages: [...head, ...forkMsgs.slice(same)] }, undefined, true);
+		return { payload: { ...main, messages: [...head, ...forkMsgs.slice(common)] }, align,
+			copiedMain: same === mainMsgs.length ? main : undefined };
 	};
-	const markFork = (payload: Record<string, unknown> | undefined, _why?: string, _aligned?: boolean) => {
-		if (payload) forkPayloads.add(payload);
-		return payload;
-	};
-	const unmark = (m: any) =>
-		Array.isArray(m?.content) ? { ...m, content: m.content.map(({ cache_control: _drop, ...b }: any) => b) } : m;
-	const sameMsg = (a: any, b: any) => JSON.stringify(unmark(a)) === JSON.stringify(unmark(b));
-	const findMarker = (msgs: any[]) => {
-		for (let i = msgs.length - 1; i >= 0; i--)
-			for (const b of Array.isArray(msgs[i]?.content) ? msgs[i].content : []) if (b?.cache_control) return b.cache_control;
-		return undefined;
-	};
-	/** How many leading messages are identical once cache markers are ignored. */
-	const commonPrefix = (main: any[], fork: any[]) => {
-		let i = 0;
-		while (i < main.length && i < fork.length && sameMsg(main[i], fork[i])) i++;
-		return i;
-	};
+	const unmark = (m: WireMessage): WireMessage =>
+		Array.isArray(m.content) ? { ...m, content: m.content.map(({ cache_control: _drop, ...b }) => b) } : m;
 
 	function relayToParent(n: { line: string; tag: Tag; evidence?: string; explanation?: string; from: string }) {
 		try {
@@ -376,23 +729,35 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	pi.on("session_start", (_e, ctx) => {
+		sessionGeneration++;
+		mainPayload = undefined;
+		lastLlmMessages = [];
 		state = loadState();
 		queuedRelays.clear();
 		inFlight?.abort();
 		inFlight = undefined;
 		notes = [];
 		answered = new Map();
+		expandedId = undefined;
+		views.clear();
+		if (undo) clearTimeout(undo.timer);
+		undo = undefined;
 		try {
 			const file = notesFile(ctx);
 			if (file) {
 				const saved = JSON.parse(readFileSync(file, "utf8"));
-				notes = saved.notes;
+				// Step numbers belong to the process that raised the note.
+				notes = saved.notes.map(({ step: _step, ...n }: Note) => n);
 				answered = new Map(saved.answered);
 			}
 		} catch (error) {
 			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
 		}
 		promptCounter = 0;
+		turnCount = 0;
+		askedAtTurn = 0;
+		inFlightTask = undefined;
+		showAll = false;
 		render(ctx);
 		if (inboxTimer) clearInterval(inboxTimer);
 		inboxTimer = undefined;
@@ -403,6 +768,7 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("session_shutdown", () => {
+		sessionGeneration++;
 		inFlight?.abort();
 		inFlight = undefined;
 		if (inboxTimer) clearInterval(inboxTimer);
@@ -420,13 +786,15 @@ export default function (pi: ExtensionAPI) {
 
 
 	// A note that survives PROMPTS_SURVIVED user prompts unanswered counts as ignored (for backoff),
-	// but stays on screen so notes can pile up until you answer or dismiss them.
+	// but stays queued until you answer or dismiss it. In the terminal only notes on screen count:
+	// the current one, or all of them while "N more waiting" is open.
 	// Unanswered notes count in RPC clients too. Extension commands are not user prompts.
 	pi.on("input", (e, ctx) => {
 		if (e.source === "extension" || e.text.trim().startsWith("/ysk")) return;
 		promptCounter++;
 		let changed = false;
-		for (const n of notes) {
+		const visible = ctx.mode === "tui" && !showAll ? notes.filter((n) => n === current()) : notes;
+		for (const n of visible) {
 			n.promptsSurvived++;
 			if (n.countedIgnored || n.promptsSurvived < PROMPTS_SURVIVED) continue;
 			n.countedIgnored = true;
@@ -441,7 +809,8 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("turn_end", (e, ctx) => {
-		lastLlmMessages = e.context.llmMessages as any[];
+		lastLlmMessages = e.context.llmMessages;
+		turnCount++;
 		if (!state.enabled || !ctx.hasUI) return;
 		const step = e.turnIndex;
 		if (!(step > 0 && step % CHECK_EVERY_STEPS === 0)) return;
@@ -457,23 +826,36 @@ export default function (pi: ExtensionAPI) {
 		const askedAt = promptCounter;
 		const seen = [...state.seen];
 		const known = [...state.known];
+		// RPC clients show and answer notes themselves, so only the terminal settles notes.
+		const waiting = ctx.mode === "tui" ? waitingNotes() : [];
+		const queueFull = ctx.mode === "tui" && notes.length >= MAX_NOTES;
+		const raisedAt = turnCount;
+		askedAtTurn = turnCount;
 		const t0 = Date.now();
 		checks++;
 		// Fire and forget: never block the main agent.
-		void (async () => {
+		inFlightTask = (async () => {
 			let outcome = "error";
-			let extra: Record<string, unknown> = {};
+			let extra: CheckDetails = {};
 			try {
-				const r = await fork(ctx, lastLlmMessages, detectPrompt(seen, known), ac.signal);
-				extra = { usage: r.usage, stopReason: r.stopReason };
-				if (ac.signal.aborted) outcome = "aborted";
-				else if (!r.text) outcome = "empty";
+				const { text, ...result } = await fork(ctx, lastLlmMessages, detectPrompt(seen, known, waiting, queueFull), ac.signal);
+				extra = { ...result, waiting: waiting.length };
+				if (ac.signal.aborted || result.stopReason === "aborted") outcome = "aborted";
+				else if (result.stopReason === "error") outcome = "error";
+				else if (promptCounter !== askedAt) outcome = "stale";
+				else if (!text) outcome = "empty";
 				else {
-					const p = parse(r.text);
+					const settled = parseSettled(text, waiting);
+					extra.settled = settled.length;
+					settle(ctx, settled, "check");
+					const p = parse(text);
 					if (p.kind !== "line") outcome = p.kind;
-					else if ([...seen, ...known].some((x) => norm(x) === norm(p.line))) outcome = "deduped";
-					else if (promptCounter !== askedAt) outcome = "stale";
-					else {
+					else if ([...seen, ...known, ...waiting.map((n) => n.line)].some((x) => norm(x) === norm(p.line))) outcome = "deduped";
+					else if (ctx.mode === "tui" && !CHILD_INBOX && notes.length >= MAX_NOTES) {
+						// Not added to seen, so a later check can raise it once there is room.
+						outcome = "queue_full";
+						extra.line = p.line;
+					} else {
 						outcome = "shown";
 						extra.line = p.line;
 						state.seen = [...state.seen, p.line].slice(-HISTORY_MAX);
@@ -491,7 +873,7 @@ export default function (pi: ExtensionAPI) {
 							outcome = "relayed";
 							return;
 						}
-						const note: Note = { id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6), line: p.line, tag: p.tag, evidence: p.evidence, explanation: p.explanation, shownAt: Date.now(), promptsSurvived: 0 };
+						const note: Note = { id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6), line: p.line, tag: p.tag, evidence: p.evidence, explanation: p.explanation, shownAt: Date.now(), promptsSurvived: 0, step: raisedAt };
 						if (ctx.mode !== "tui" && !note.explanation) {
 							// The client's "Explain" has nothing to ask, so write the explanation now.
 							try {
@@ -499,7 +881,6 @@ export default function (pi: ExtensionAPI) {
 							} catch {}
 						}
 						notes.push(note);
-						while (ctx.mode === "tui" && notes.length > MAX_NOTES) log({ event: "overflow_dropped", line: notes.shift()!.line });
 						render(ctx);
 						if (ctx.mode !== "tui") announce(ctx, note);
 					}
@@ -509,8 +890,51 @@ export default function (pi: ExtensionAPI) {
 				extra.error = String(err);
 			} finally {
 				if (inFlight === ac) inFlight = undefined;
-				log({ event: "check", step, outcome, ms: Date.now() - t0, align: lastAlign, ...extra });
+				log({ event: "check", step, outcome, ms: Date.now() - t0, ...extra });
 				if (DEBUG) ctx.ui.notify(`you-should-know: step ${step} \u2192 ${outcome} (${Date.now() - t0}ms)`, "info");
+			}
+		})();
+	});
+
+	// When the run ends, ask once more which waiting notes the agent has since dealt with,
+	// unless the last check already saw the final step. A check still running finishes first.
+	pi.on("agent_before_settle", (e, ctx) => {
+		lastLlmMessages = e.context.llmMessages;
+		if (!state.enabled || ctx.mode !== "tui" || CHILD_INBOX) return;
+		const messages = lastLlmMessages;
+		const generation = sessionGeneration, askedAt = promptCounter, turn = turnCount;
+		const pending = inFlightTask;
+		// Do not return this promise: Pi must reach idle while side requests finish.
+		inFlightTask = (async () => {
+			await pending;
+			if (generation !== sessionGeneration || askedAt !== promptCounter || turn !== turnCount || !state.enabled ||
+				inFlight || notes.length === 0 || askedAtTurn === turnCount) return;
+			const ac = new AbortController();
+			inFlight = ac;
+			askedAtTurn = turnCount;
+			const waiting = waitingNotes();
+			const t0 = Date.now();
+			let outcome = "error";
+			let extra: CheckDetails = {};
+			try {
+				const { text, ...result } = await fork(ctx, messages, settlePrompt(waiting), ac.signal);
+				extra = result;
+				if (ac.signal.aborted || result.stopReason === "aborted") outcome = "aborted";
+				else if (result.stopReason === "error") outcome = "error";
+				else if (promptCounter !== askedAt || turnCount !== turn) outcome = "stale";
+				else {
+					const settled = parseSettled(text, waiting);
+					extra.settled = settled.length;
+					settle(ctx, settled, "end");
+					outcome = "done";
+				}
+			} catch (err) {
+				outcome = ac.signal.aborted ? "aborted" : "error";
+				extra.error = String(err);
+			} finally {
+				if (inFlight === ac) inFlight = undefined;
+				log({ event: "settle", outcome, waiting: waiting.length, ms: Date.now() - t0, ...extra });
+				if (DEBUG) ctx.ui.notify(`you-should-know: settle \u2192 ${outcome}, ${extra.settled ?? 0} of ${waiting.length} (${Date.now() - t0}ms)`, "info");
 			}
 		})();
 	});
@@ -522,16 +946,19 @@ export default function (pi: ExtensionAPI) {
 			text = (await fork(ctx, lastLlmMessages, explainPrompt(n.line), new AbortController().signal)).text;
 		}
 		while (true) {
-			const choice = ctx.mode !== "tui" ? await explainBySelect(ctx, n, text!) : await ctx.ui.custom<string>((_tui, theme, _kb, done) => {
+			const choice = await ctx.ui.custom<string>((_tui, theme, _kb, done) => {
 				const c = new Container();
 				const border = new DynamicBorder((s: string) => theme.fg("accent", s));
 				c.addChild(border);
 				c.addChild(new Text(theme.fg("accent", `\u2726 ${n.tag}`), 1, 0));
-				c.addChild(new Markdown(text!, 1, 1, getMarkdownTheme()));  // (keys, unlisted: 1/Enter understood, 2 chat, s simpler, l less, m more, 0/Esc dismiss)
+				c.addChild(new Markdown(text!, 1, 1, getMarkdownTheme()));
+				// Enter and Esc also work: Enter means Got it, Esc means Dismiss.
+				c.addChild(new ButtonRow(EXPLAIN_SCREEN_BUTTONS, theme, done));
 				c.addChild(border);
 				return {
 					render: (w: number) => c.render(w),
 					invalidate: () => c.invalidate(),
+					handleMouse: (e: TuiMouseEvent) => c.handleMouse(e),
 					handleInput: (d: string) => {
 						if (d === "1" || matchesKey(d, "enter")) done("understood");
 						else if (d === "2") done("chat");
@@ -561,14 +988,6 @@ export default function (pi: ExtensionAPI) {
 			if (choice === "chat") chatInMain(n, text);
 			return;
 		}
-	}
-
-	// Outside the terminal UI: the explanation as a notice, then the same choices as a select.
-	const EXPLAIN_OPTIONS = { Understood: "understood", "Chat in main session": "chat", "Simpler words": "simpler_words", "Less detail": "less_detail", "More detail": "more_detail" } as const;
-	async function explainBySelect(ctx: ExtensionContext, n: Note, text: string) {
-		ctx.ui.notify(`${n.tag} \u00b7 ${n.line}\n\n${text}`, "info");
-		const pick = await ctx.ui.select(`${n.tag} \u00b7 ${n.line}`, Object.keys(EXPLAIN_OPTIONS));
-		return pick ? EXPLAIN_OPTIONS[pick as keyof typeof EXPLAIN_OPTIONS] : "dismiss";
 	}
 
 	// CC's un(): quote the note into the main session.
@@ -602,8 +1021,9 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 		if (arg === "status") {
+			const { model, thinking } = pickModel(ctx);
 			ctx.ui.notify(
-				`You should know: ${state.enabled ? "on" : "off"} \u00b7 ${checks} checks this session \u00b7 skip ${state.skip} \u00b7 model ${pickModel(ctx)?.id ?? "?"} \u00b7 log ${LOG_FILE}`,
+				`You should know: ${state.enabled ? "on" : "off"} \u00b7 ${checks} checks this session \u00b7 skip ${state.skip} \u00b7 model ${model?.provider ?? "?"}/${model?.id ?? "?"} \u00b7 thinking ${thinking ?? "main request"} \u00b7 config ${CONFIG_FILE} \u00b7 log ${LOG_FILE}`,
 				"info",
 			);
 			return;
@@ -617,23 +1037,16 @@ export default function (pi: ExtensionAPI) {
 			ctx.ui.notify("Answer notes where your client shows them.", "info");
 			return;
 		}
-		const n = notes[0];
+		const n = current();
 		const options = ["1 Learn more", "2 Knew this already", "3 Chat in main session", "0 Dismiss"];
 		const pick = await ctx.ui.select(`${n.tag} \u00b7 ${n.line}`, options);
-		if (!pick) return;
-		if (notes[0] === n) popNote(ctx);
-		else {
-			notes = notes.filter((x) => x !== n);
-			render(ctx);
-		}
-		state.ignoredInARow = 0;
-		state.skip = 0;
+		if (!pick || !notes.includes(n)) return;
+		removeNote(ctx, n);
 		const k = pick[0];
 		log({ event: "answer", answer: { "1": "learn_more", "2": "knew", "3": "chat", "0": "dismiss" }[k], line: n.line, msToAnswer: Date.now() - n.shownAt });
 		if (k === "1") await showExplanation(ctx, n).catch((err) => ctx.ui.notify(`Couldn\u2019t write that explanation: ${err}`, "error"));
 		else if (k === "2") remember(n.line, true);
 		else if (k === "3") chatInMain(n, n.explanation);
-		saveState(state);
 	}
 
 	// RPC clients answer notes in their own UI, then send `/ysk answer <id> <action>`
@@ -667,13 +1080,11 @@ export default function (pi: ExtensionAPI) {
 		log({ event: "answer", answer, via: "client", line: n.line, msToAnswer: Date.now() - n.shownAt });
 	}
 
-	// One keystroke: dismiss the top note, no menu.
+	// One keystroke: dismiss the current note, no menu.
 	function quickDismiss(ctx: ExtensionContext) {
-		const n = popNote(ctx);
+		const n = current();
 		if (!n) return;
-		state.ignoredInARow = 0;
-		state.skip = 0;
-		saveState(state);
+		removeNote(ctx, n);
 		log({ event: "answer", answer: "dismiss", via: "alt+x", line: n.line, msToAnswer: Date.now() - n.shownAt });
 	}
 
