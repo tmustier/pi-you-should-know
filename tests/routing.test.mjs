@@ -12,14 +12,17 @@ import { zstdDecompressSync } from 'node:zlib';
 // Real Pi and real provider serializers, with local protocol servers instead of
 // paid models. The wire request, resulting check and RPC notice own the contract.
 const cases = [
-  { name: 'GPT default', api: 'openai-codex-responses', provider: 'openai-codex', main: 'gpt-6-astra', side: 'gpt-6.1-sol', thinking: 'high' },
+  { name: 'GPT default is the cached main model and level', api: 'openai-codex-responses', provider: 'openai-codex', main: 'gpt-6-astra', side: 'gpt-6-astra', thinking: 'low', cached: true },
+  { name: 'GPT route to the main model and level is the cached request', api: 'openai-responses', provider: 'openai', main: 'gpt-6-astra', side: 'gpt-6-astra', thinking: 'low', cached: true, config: { gpt: { model: 'openai/gpt-6-astra', thinking: 'low' } } },
   { name: 'GPT configurable same-model thinking', api: 'openai-responses', provider: 'openai', main: 'gpt-6-astra', side: 'gpt-6-astra', thinking: 'medium', config: { gpt: { model: 'openai/gpt-6-astra', thinking: 'medium' } } },
-  { name: 'GPT environment model override', api: 'openai-completions', provider: 'openai', main: 'gpt-6-astra', side: 'gpt-6-sol', thinking: 'high', override: 'openai/gpt-6-sol' },
-  { name: 'Fable family default', api: 'anthropic-messages', provider: 'anthropic', main: 'claude-fable-5-1', side: 'claude-opus-5-5', thinking: 'medium' },
+  { name: 'GPT configurable model', api: 'openai-codex-responses', provider: 'openai-codex', main: 'gpt-6-astra', side: 'gpt-6.1-sol', thinking: 'high', config: { gpt: { model: 'openai-codex/gpt-6.1-sol', thinking: 'high' } } },
+  { name: 'GPT environment model override', api: 'openai-completions', provider: 'openai', main: 'gpt-6-astra', side: 'gpt-6-sol', thinking: 'high', override: 'openai/gpt-6-sol', config: { gpt: { thinking: 'high' } } },
+  { name: 'Fable default is the cached main model and level', api: 'anthropic-messages', provider: 'anthropic', main: 'claude-fable-5-1', side: 'claude-fable-5-1', thinking: 'low', cached: true },
   { name: 'Fable configurable model and thinking', api: 'anthropic-messages', provider: 'anthropic', main: 'claude-fable-5', side: 'claude-sonnet-5', thinking: 'high', config: { fable: { model: 'anthropic/claude-sonnet-5', thinking: 'high' } } },
-  { name: 'other Claude preserves cache and thinking', api: 'anthropic-messages', provider: 'anthropic', main: 'claude-sonnet-5', side: 'claude-sonnet-5', thinking: 'low' },
+  { name: 'other Claude preserves cache and thinking', api: 'anthropic-messages', provider: 'anthropic', main: 'claude-sonnet-5', side: 'claude-sonnet-5', thinking: 'low', cached: true },
+  { name: 'Claude cache survives a leading message another extension adds', api: 'anthropic-messages', provider: 'anthropic', main: 'claude-sonnet-5', side: 'claude-sonnet-5', thinking: 'low', cached: true, inject: true },
   { name: 'unknown configured model does not fall back to main', api: 'openai-responses', provider: 'openai', main: 'gpt-6-astra', side: 'gpt-6-sol', config: { gpt: { model: 'openai/not-a-registered-model' } }, missing: true },
-  { name: 'GPT provider error is not an empty answer', api: 'openai-responses', provider: 'openai', main: 'gpt-6-astra', side: 'gpt-6-sol', thinking: 'high', config: { gpt: { model: 'openai/gpt-6-sol' } }, error: true },
+  { name: 'GPT provider error is not an empty answer', api: 'openai-responses', provider: 'openai', main: 'gpt-6-astra', side: 'gpt-6-sol', thinking: 'high', config: { gpt: { model: 'openai/gpt-6-sol', thinking: 'high' } }, error: true },
 ];
 
 for (const scenario of cases) test(scenario.name, { timeout: 20_000 }, async () => {
@@ -30,6 +33,13 @@ for (const scenario of cases) test(scenario.name, { timeout: 20_000 }, async () 
   if (scenario.config) writeFileSync(join(logDir, 'config.json'), JSON.stringify(scenario.config));
   const receipt = join(root, 'receipt.txt');
   writeFileSync(receipt, 'Local fixture.');
+  // Like the Anthropic OAuth fix: moves context into a leading user message after Pi builds the request.
+  const injector = join(root, 'injector.ts');
+  writeFileSync(injector, `export default (pi) => pi.on('before_provider_request', (event) => {
+    const p = event.payload;
+    if (!Array.isArray(p?.messages) || p.messages[0]?.content?.[0]?.text?.startsWith('<system-reminder>')) return undefined;
+    return { ...p, messages: [{ role: 'user', content: [{ type: 'text', text: '<system-reminder>moved context</system-reminder>' }] }, ...p.messages] };
+  });`);
   let child, mainPayload, sidePayload, stderr = '';
   const notices = [];
   const server = createServer(async (request, response) => {
@@ -84,7 +94,7 @@ for (const scenario of cases) test(scenario.name, { timeout: 20_000 }, async () 
     delete env.PI_SUBAGENT_ACTIVITY_FILE; delete env.YSK_MODEL;
     if (scenario.override) env.YSK_MODEL = scenario.override;
     const check = await new Promise((resolve, reject) => {
-      child = spawn('pi', ['--mode', 'rpc', '--offline', '--no-skills', '--no-context-files', '--no-extensions', '-e', process.env.YSK_TEST_SOURCE ?? fileURLToPath(new URL('../extensions/you-should-know/index.ts', import.meta.url)), '--provider', scenario.provider, '--model', scenario.main, '--thinking', 'low', '--session', join(root, 'session.jsonl')], { cwd: root, env, stdio: ['pipe', 'pipe', 'pipe'], signal: AbortSignal.timeout(18_000) });
+      child = spawn('pi', ['--mode', 'rpc', '--offline', '--no-skills', '--no-context-files', '--no-extensions', ...(scenario.inject ? ['-e', injector] : []), '-e', process.env.YSK_TEST_SOURCE ?? fileURLToPath(new URL('../extensions/you-should-know/index.ts', import.meta.url)), '--provider', scenario.provider, '--model', scenario.main, '--thinking', 'low', '--session', join(root, 'session.jsonl')], { cwd: root, env, stdio: ['pipe', 'pipe', 'pipe'], signal: AbortSignal.timeout(18_000) });
       child.on('error', reject);
       child.on('exit', () => reject(new Error(`Pi exited before check: ${stderr}`)));
       child.stderr.on('data', data => { stderr += data; });
@@ -115,10 +125,17 @@ for (const scenario of cases) test(scenario.name, { timeout: 20_000 }, async () 
     const effort = p => p.reasoning?.effort ?? p.reasoning_effort ?? p.messages?.findLast(m => m.output_config)?.output_config.effort ?? p.output_config?.effort;
     assert.equal(effort(mainPayload), 'low');
     assert.equal(effort(sidePayload), scenario.thinking);
-    if (scenario.name.startsWith('other Claude')) {
+    if (scenario.cached) {
+      // The main request's bytes, so the provider can read its prompt cache.
       assert.deepEqual(sidePayload.tools, mainPayload.tools);
-      assert.deepEqual(sidePayload.system, mainPayload.system);
-      assert.equal(check.align.aligned, true);
+      assert.deepEqual(sidePayload.system ?? sidePayload.instructions, mainPayload.system ?? mainPayload.instructions);
+      assert.notEqual(check.align.why, 'independent side request');
+      if (scenario.inject) {
+        assert.equal(sidePayload.messages[0].content[0].text, '<system-reminder>moved context</system-reminder>');
+        assert.equal(sidePayload.messages.filter(m => m.content?.[0]?.text === '<system-reminder>moved context</system-reminder>').length, 1);
+        assert.equal(check.align.lead, 1);
+        assert.equal(check.align.common, check.align.mainLen - 1, JSON.stringify(check.align));
+      }
     } else {
       assert.equal(sidePayload.tool_choice?.type ?? sidePayload.tool_choice, 'none');
     }

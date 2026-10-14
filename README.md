@@ -31,13 +31,9 @@ When the extension runs inside a [pi-herdr-subagents](https://github.com/aliceis
 
 ## Side models
 
-YSK uses these defaults, independently of the main agent's thinking level:
+By default each check uses the main model at the main thinking level. The check then starts with the same request bytes as the main agent and reads the main conversation from the prompt cache. Another model, or the same model at another thinking level, misses that cache and pays for the whole conversation again: on GPT-6.1 Sol a check read 72% to 83% of its input from cache at the main level and 0% at another level, about four times the cost.
 
-- GPT models → `openai-codex/gpt-6.1-sol`, high thinking.
-- Claude Fable models (including versioned variants) → `anthropic/claude-opus-5-5`, medium thinking.
-- Other models → the main model. Other Claude models keep their existing same-model request behavior.
-
-Both family routes are configurable in `~/.pi/agent/you-should-know/config.json` (under `PI_CODING_AGENT_DIR` when set):
+You can still route a model family to another model or thinking level in `~/.pi/agent/you-should-know/config.json` (under `PI_CODING_AGENT_DIR` when set):
 
 ```json
 {
@@ -46,13 +42,13 @@ Both family routes are configurable in `~/.pi/agent/you-should-know/config.json`
 }
 ```
 
-Each model value is a registered `provider/model-id`, using that provider's credentials. Thinking accepts `off`, `minimal`, `low`, `medium`, `high`, `xhigh` or `max`, subject to the selected model's support. Missing fields use the defaults above. Changes apply to the next check or explanation; `/ysk status` shows the effective model, thinking and config path.
+`gpt` covers GPT models and `fable` covers Claude Fable models (including versioned variants). Each model value is a registered `provider/model-id`, using that provider's credentials; a missing model means the main model. Thinking accepts `off`, `minimal`, `low`, `medium`, `high`, `xhigh` or `max`, subject to the selected model's support. A route to the main model at the main thinking level is treated as the cached default. Changes apply to the next check or explanation; `/ysk status` shows the effective model, thinking and config path.
 
-The existing `YSK_MODEL` environment variable overrides the model for any family, including other Claude models. It does not override the GPT/Fable thinking setting. Unknown model IDs fail the check rather than silently using the main model.
+The existing `YSK_MODEL` environment variable overrides the model for any family. Unknown model IDs fail the check rather than silently using the main model.
 
 ## Cost
 
-Same-model Claude checks reuse the main request's cached prefix. A different side model still receives the conversation, but can cost more because that cache reuse is not guaranteed. Every check is logged, with token usage, to `~/.pi/agent/you-should-know/checks.jsonl`.
+A same-model check copies the main request (tools, system prompt, thinking) and adds only the new turn and the question, so most of its input is read from cache. This also works when another extension puts a message in front of the main request, as the Anthropic OAuth fix does. Pi does not run other extensions' request hooks on a check's own request, so an extension that rewrites requests (such as the OAuth fix) must load before this one. Every check is logged, with token usage, to `~/.pi/agent/you-should-know/checks.jsonl`.
 
 ## Install
 

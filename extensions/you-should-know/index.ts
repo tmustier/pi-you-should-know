@@ -315,26 +315,30 @@ export default function (pi: ExtensionAPI) {
 		state.known = readKnowledge(state.known);
 	};
 
-	// Explicit provider/model IDs keep authentication on the selected provider.
-	const defaultRoutes = {
-		gpt: { model: "openai-codex/gpt-6.1-sol", thinking: "high" },
-		fable: { model: "anthropic/claude-opus-5-5", thinking: "medium" },
-	} as const;
+	// By default a check uses the main model at the main thinking level. The side request then
+	// starts with the same bytes as the main request and reads its prompt cache. Another model,
+	// or the same model at another thinking level, misses that cache: on gpt-6.1-sol a check read
+	// 72% of its input from cache at the main level and 0% at another. Each family can still be
+	// routed in config.json; explicit provider/model IDs keep authentication on that provider.
 	const thinkingLevels = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
+	const isMain = (ctx: ExtensionContext, model: { provider: string; id: string } | undefined) =>
+		!!model && model.provider === ctx.model?.provider && model.id === ctx.model?.id;
 	const pickModel = (ctx: ExtensionContext) => {
 		const id = ctx.model?.id.split("/").at(-1) ?? "";
 		const family = /^gpt-/i.test(id) ? "gpt" : /^claude-fable(?:-|$)/i.test(id) ? "fable" : undefined;
 		const config = existsSync(CONFIG_FILE) ? JSON.parse(readFileSync(CONFIG_FILE, "utf8")) : {};
-		const route = family ? { ...defaultRoutes[family], ...config[family] } : undefined;
+		const route = family ? config[family] : undefined;
 		const override = process.env.YSK_MODEL?.trim();
 		if (!override && !route) return { model: ctx.model, thinking: undefined };
-		const requested = override || route?.model;
+		const requested = override || route?.model || (ctx.model && `${ctx.model.provider}/${ctx.model.id}`);
 		if (typeof requested !== "string" || !requested.includes("/")) throw new Error("YSK model must be provider/model-id");
 		const at = requested.indexOf("/");
 		const model = ctx.modelRegistry.find(requested.slice(0, at), requested.slice(at + 1));
 		if (!model) throw new Error(`YSK model not found: ${requested}`);
 		const thinking = route?.thinking;
 		if (thinking !== undefined && !thinkingLevels.includes(thinking)) throw new Error("Invalid YSK thinking level in " + CONFIG_FILE);
+		// A route to the main model at the main level is the cached same-model request.
+		if (isMain(ctx, model) && (thinking === undefined || thinking === pi.getThinkingLevel())) return { model, thinking: undefined };
 		return { model, thinking };
 	};
 
@@ -552,6 +556,7 @@ export default function (pi: ExtensionAPI) {
 	async function fork(ctx: ExtensionContext, llmMessages: any[], prompt: string, signal: AbortSignal) {
 		const { model, thinking } = pickModel(ctx);
 		if (!model) throw new Error("no model");
+		const same = isMain(ctx, model) && thinking === undefined;
 		const messages = [
 			...llmMessages,
 			{ role: "user" as const, content: [{ type: "text" as const, text: prompt }], timestamp: Date.now() },
@@ -561,16 +566,16 @@ export default function (pi: ExtensionAPI) {
 		const options = {
 			signal, sessionId: ctx.sessionManager.getSessionId(),
 			onPayload: (p: unknown) => {
-				// Anthropic cache alignment must not overwrite a routed model's
-				// converted history or its independent thinking setting.
-				if (model.api === "anthropic-messages" && model.provider === ctx.model?.provider && model.id === ctx.model?.id && thinking === undefined) return alignWithMain(p);
+				// Cache alignment copies the main request (tools, system, thinking), so it must
+				// not overwrite a routed model's converted history or its own thinking setting.
+				if (same) return alignWithMain(p);
 				lastAlign = { aligned: false, why: "independent side request" };
 				return undefined;
 			},
 		};
-		// Preserve the working same-model Claude path. Routes use Pi's neutral
+		// The same-model request reuses the main request's payload. Routes use Pi's neutral
 		// thinking option, translated by each provider to its native wire format.
-		const res = thinking === undefined && model.api === "anthropic-messages"
+		const res = same
 			? await ctx.modelRegistry.complete(model, context, options)
 			: await ctx.modelRegistry.streamSimple(model, context, { ...options, reasoning: thinking, toolChoice: "none" }).result();
 		return { text: textOf(res), usage: res.usage, stopReason: res.stopReason, error: res.errorMessage, provider: model.provider, model: model.id, thinking };
@@ -619,9 +624,13 @@ export default function (pi: ExtensionAPI) {
 		if (key === "input") return markFork({ ...main, input: f["input"] }, undefined, true);
 		const mainMsgs = main[key] as any[];
 		const forkMsgs = (f[key] as any[]).map(unmark);
-		const same = commonPrefix(mainMsgs, forkMsgs);
-		lastAlign = { aligned: true, mainLen: mainMsgs.length, forkLen: forkMsgs.length, common: same };
-		if (same === 0) return markFork({ ...main, messages: forkMsgs }, undefined, true);
+		// Another extension may put messages in front of the main request after Pi builds it (the
+		// Anthropic OAuth fix moves the system prompt into a leading user message), so the fork's
+		// first message can match a later one in main. Main's leading messages are kept as sent.
+		const { lead, common } = alignment(mainMsgs, forkMsgs);
+		const same = lead + common;
+		lastAlign = { aligned: true, mainLen: mainMsgs.length, forkLen: forkMsgs.length, lead, common };
+		if (common === 0) return markFork({ ...main, messages: forkMsgs }, undefined, true);
 		const head = mainMsgs.slice(0, same);
 		if (same < mainMsgs.length) {
 			// Main's marker fell outside the match: put the same marker on the last
@@ -636,7 +645,7 @@ export default function (pi: ExtensionAPI) {
 			}
 		}
 		// Main's own messages (marker included), then the new tail, unmarked.
-		return markFork({ ...main, messages: [...head, ...forkMsgs.slice(same)] }, undefined, true);
+		return markFork({ ...main, messages: [...head, ...forkMsgs.slice(common)] }, undefined, true);
 	};
 	const markFork = (payload: Record<string, unknown> | undefined, _why?: string, _aligned?: boolean) => {
 		if (payload) forkPayloads.add(payload);
@@ -650,11 +659,20 @@ export default function (pi: ExtensionAPI) {
 			for (const b of Array.isArray(msgs[i]?.content) ? msgs[i].content : []) if (b?.cache_control) return b.cache_control;
 		return undefined;
 	};
-	/** How many leading messages are identical once cache markers are ignored. */
-	const commonPrefix = (main: any[], fork: any[]) => {
+	/** How many messages match, once cache markers are ignored, when the fork starts at main[lead]. */
+	const commonFrom = (main: any[], fork: any[], lead: number) => {
 		let i = 0;
-		while (i < main.length && i < fork.length && sameMsg(main[i], fork[i])) i++;
+		while (lead + i < main.length && i < fork.length && sameMsg(main[lead + i], fork[i])) i++;
 		return i;
+	};
+	/** The number of messages main has in front of the fork's first message, and how many match from there. */
+	const alignment = (main: any[], fork: any[]) => {
+		let best = { lead: 0, common: commonFrom(main, fork, 0) };
+		for (let lead = 1; lead < main.length && best.common < main.length - lead; lead++) {
+			const common = commonFrom(main, fork, lead);
+			if (common > best.common) best = { lead, common };
+		}
+		return best;
 	};
 
 	function relayToParent(n: { line: string; tag: Tag; evidence?: string; explanation?: string; from: string }) {
