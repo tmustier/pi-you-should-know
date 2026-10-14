@@ -13,16 +13,19 @@ import { zstdDecompressSync } from 'node:zlib';
 // paid models. The wire request, resulting check and RPC notice own the contract.
 const cases = [
   { name: 'GPT default is the cached main model and level', api: 'openai-codex-responses', provider: 'openai-codex', main: 'gpt-6-astra', side: 'gpt-6-astra', thinking: 'low', cached: true },
+  { name: 'Chat Completions tool history preserves main cache settings', api: 'openai-completions', provider: 'openai', main: 'gpt-6-astra', side: 'gpt-6-astra', thinking: 'low', cached: true },
   { name: 'GPT route to the main model and level is the cached request', api: 'openai-responses', provider: 'openai', main: 'gpt-6-astra', side: 'gpt-6-astra', thinking: 'low', cached: true, config: { gpt: { model: 'openai/gpt-6-astra', thinking: 'low' } } },
   { name: 'GPT configurable same-model thinking', api: 'openai-responses', provider: 'openai', main: 'gpt-6-astra', side: 'gpt-6-astra', thinking: 'medium', config: { gpt: { model: 'openai/gpt-6-astra', thinking: 'medium' } } },
   { name: 'GPT configurable model', api: 'openai-codex-responses', provider: 'openai-codex', main: 'gpt-6-astra', side: 'gpt-6.1-sol', thinking: 'high', config: { gpt: { model: 'openai-codex/gpt-6.1-sol', thinking: 'high' } } },
   { name: 'GPT environment model override', api: 'openai-completions', provider: 'openai', main: 'gpt-6-astra', side: 'gpt-6-sol', thinking: 'high', override: 'openai/gpt-6-sol', config: { gpt: { thinking: 'high' } } },
   { name: 'Fable default is the cached main model and level', api: 'anthropic-messages', provider: 'anthropic', main: 'claude-fable-5-1', side: 'claude-fable-5-1', thinking: 'low', cached: true },
   { name: 'Fable configurable model and thinking', api: 'anthropic-messages', provider: 'anthropic', main: 'claude-fable-5', side: 'claude-sonnet-5', thinking: 'high', config: { fable: { model: 'anthropic/claude-sonnet-5', thinking: 'high' } } },
+  { name: 'Fable thinking off disables reasoning', api: 'anthropic-messages', provider: 'anthropic', main: 'claude-fable-5-1', side: 'claude-fable-5-1', config: { fable: { thinking: 'off' } } },
   { name: 'other Claude preserves cache and thinking', api: 'anthropic-messages', provider: 'anthropic', main: 'claude-sonnet-5', side: 'claude-sonnet-5', thinking: 'low', cached: true },
   { name: 'Claude cache survives a leading message another extension adds', api: 'anthropic-messages', provider: 'anthropic', main: 'claude-sonnet-5', side: 'claude-sonnet-5', thinking: 'low', cached: true, inject: true },
   { name: 'debug check passes a check that reads the main cache', api: 'anthropic-messages', provider: 'anthropic', main: 'claude-sonnet-5', side: 'claude-sonnet-5', thinking: 'low', cached: true, cacheUsage: { main: [1000, 200], side: 1200 } },
   { name: 'debug check flags a check that misses the main cache', api: 'anthropic-messages', provider: 'anthropic', main: 'claude-sonnet-5', side: 'claude-sonnet-5', thinking: 'low', cached: true, cacheUsage: { main: [1000, 200], side: 100 } },
+  { name: 'partial prefix reuse does not claim the entire main cache', api: 'anthropic-messages', provider: 'anthropic', main: 'claude-sonnet-5', side: 'claude-sonnet-5', thinking: 'low', cached: true, inject: 'partial', cacheUsage: { main: [1000, 200], side: 100 } },
   { name: 'unknown configured model does not fall back to main', api: 'openai-responses', provider: 'openai', main: 'gpt-6-astra', side: 'gpt-6-sol', config: { gpt: { model: 'openai/not-a-registered-model' } }, missing: true },
   { name: 'GPT provider error is not an empty answer', api: 'openai-responses', provider: 'openai', main: 'gpt-6-astra', side: 'gpt-6-sol', thinking: 'high', config: { gpt: { model: 'openai/gpt-6-sol', thinking: 'high' } }, error: true },
 ];
@@ -40,6 +43,7 @@ for (const scenario of cases) test(scenario.name, { timeout: 20_000 }, async () 
   writeFileSync(injector, `export default (pi) => pi.on('before_provider_request', (event) => {
     const p = event.payload;
     if (!Array.isArray(p?.messages) || p.messages[0]?.content?.[0]?.text?.startsWith('<system-reminder>')) return undefined;
+    if (${scenario.inject === 'partial'}) return { ...p, messages: p.messages.map((m, i) => i === p.messages.length - 1 ? { ...m, content: [...m.content, { type: 'text', text: 'main-only suffix' }] } : m) };
     return { ...p, messages: [{ role: 'user', content: [{ type: 'text', text: '<system-reminder>moved context</system-reminder>' }] }, ...p.messages] };
   });`);
   let child, mainPayload, sidePayload, stderr = '';
@@ -133,12 +137,19 @@ for (const scenario of cases) test(scenario.name, { timeout: 20_000 }, async () 
       assert.deepEqual(sidePayload.tools, mainPayload.tools);
       assert.deepEqual(sidePayload.system ?? sidePayload.instructions, mainPayload.system ?? mainPayload.instructions);
       assert.notEqual(check.align.why, 'independent side request');
-      if (scenario.cacheUsage) {
+      if (scenario.inject === 'partial') {
+        assert.equal(check.cache, undefined);
+        assert.ok(check.align.common > 0 && check.align.common < check.align.mainLen);
+        assert.ok(!notices.some(n => n.startsWith('you-should-know: a check read')));
+        const retained = sidePayload.messages[check.align.common - 1];
+        assert.deepEqual(retained.content.at(-1).cache_control, { type: 'ephemeral' });
+        assert.ok(sidePayload.messages.slice(check.align.common).every(m => !m.content?.some(b => b.cache_control)));
+      } else if (scenario.cacheUsage) {
         const ok = scenario.cacheUsage.side >= 1200;
         assert.deepEqual(check.cache, { read: scenario.cacheUsage.side, expected: 1200, ok });
         assert.equal(notices.some(n => n.startsWith('you-should-know: a check read')), !ok);
       } else assert.equal(check.cache, undefined);
-      if (scenario.inject) {
+      if (scenario.inject === true) {
         assert.equal(sidePayload.messages[0].content[0].text, '<system-reminder>moved context</system-reminder>');
         assert.equal(sidePayload.messages.filter(m => m.content?.[0]?.text === '<system-reminder>moved context</system-reminder>').length, 1);
         assert.equal(check.align.lead, 1);
@@ -146,6 +157,7 @@ for (const scenario of cases) test(scenario.name, { timeout: 20_000 }, async () 
       }
     } else {
       assert.equal(sidePayload.tool_choice?.type ?? sidePayload.tool_choice, 'none');
+      if (scenario.config?.fable?.thinking === 'off') assert.deepEqual(sidePayload.thinking, { type: 'disabled' });
     }
     if (scenario.error) {
       assert.match(check.error, /fixture rejection/);

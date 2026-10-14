@@ -17,7 +17,8 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync, appendFileSync, rea
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
+import type { Context, Message, Usage } from "@earendil-works/pi-ai";
 import { DynamicBorder, getMarkdownTheme } from "@earendil-works/pi-coding-agent";
 import type { Component, TuiMouseEvent } from "@earendil-works/pi-tui";
 import { Container, Markdown, matchesKey, Text, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
@@ -186,7 +187,7 @@ function parseSettled(text: string, waiting: Waiting[]): string[] {
 type Button<A extends string> = { label: string; action: A; dim?: boolean };
 type Hit<A extends string> = { x0: number; x1: number; action: A };
 /** Lays buttons out left to right after `indent` columns, wrapping when they do not fit, and records where each one landed. */
-function layoutButtons<A extends string>(buttons: Button<A>[], width: number, indent: number, theme: any) {
+function layoutButtons<A extends string>(buttons: Button<A>[], width: number, indent: number, theme: Theme) {
 	const lines: string[] = [];
 	const hits: Hit<A>[][] = [];
 	let line = " ".repeat(indent);
@@ -220,9 +221,9 @@ const clicked = <A extends string>(row: Hit<A>[] | undefined, e: TuiMouseEvent) 
 class ButtonRow<A extends string> implements Component {
 	private hits: Hit<A>[][] = [];
 	private buttons: Button<A>[];
-	private theme: any;
+	private theme: Theme;
 	private onPress: (action: A) => void;
-	constructor(buttons: Button<A>[], theme: any, onPress: (action: A) => void) {
+	constructor(buttons: Button<A>[], theme: Theme, onPress: (action: A) => void) {
 		this.buttons = buttons;
 		this.theme = theme;
 		this.onPress = onPress;
@@ -280,14 +281,20 @@ const EXPLAIN_SCREEN_BUTTONS: Button<string>[] = [
 	{ label: "0 Dismiss", action: "dismiss", dim: true },
 ];
 
-const textOf = (msg: { content: unknown }) =>
-	Array.isArray(msg.content)
-		? msg.content
-				.filter((c: any) => c?.type === "text" && typeof c.text === "string")
-				.map((c: any) => c.text)
-				.join("\n")
-				.trim()
-		: "";
+// Provider payloads keep their other fields when spread; only these fields are inspected.
+type WireBlock = { type: string; cache_control?: object };
+type WireMessage = { content?: string | WireBlock[] | null };
+type Payload = { model: string; messages?: WireMessage[]; input?: unknown[] };
+const isObject = (value: unknown): value is Record<string, unknown> => value !== null && typeof value === "object";
+function payload(value: unknown): Payload | undefined {
+	if (!isObject(value) || typeof value.model !== "string") return;
+	if (Array.isArray(value.input)) return value as Payload;
+	if (Array.isArray(value.messages) && value.messages.every((m: unknown) => isObject(m) &&
+		(m.content == null || typeof m.content === "string" || Array.isArray(m.content) &&
+			m.content.every((b: unknown) => isObject(b) && typeof b.type === "string")))) return value as Payload;
+}
+type Alignment = { aligned: boolean; why?: string; mainLen?: number; forkLen?: number; lead?: number; common?: number };
+type Aligned = { payload?: Payload; copiedMain?: Payload; align: Alignment };
 
 export default function (pi: ExtensionAPI) {
 	let state = loadState();
@@ -302,6 +309,7 @@ export default function (pi: ExtensionAPI) {
 	let inFlight: AbortController | undefined;
 	let inFlightTask: Promise<void> | undefined;
 	let promptCounter = 0; // stands in for CC's turnId staleness check
+	let sessionGeneration = 0;
 	let checks = 0;
 	// Steps seen this process, and the step the last side request looked at. A note remembers
 	// the step it was raised at, so a later request can tell how long it has been waiting.
@@ -315,19 +323,20 @@ export default function (pi: ExtensionAPI) {
 		state.known = readKnowledge(state.known);
 	};
 
-	// By default a check uses the main model at the main thinking level. The side request then
-	// starts with the same bytes as the main request and reads its prompt cache. Another model,
-	// or the same model at another thinking level, misses that cache: on gpt-6.1-sol a check read
-	// 72% of its input from cache at the main level and 0% at another. Each family can still be
-	// routed in config.json; explicit provider/model IDs keep authentication on that provider.
+	// Same model and thinking reuse main's cache; explicit routes retain their provider.
 	const thinkingLevels = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
 	const isMain = (ctx: ExtensionContext, model: { provider: string; id: string } | undefined) =>
 		!!model && model.provider === ctx.model?.provider && model.id === ctx.model?.id;
 	const pickModel = (ctx: ExtensionContext) => {
 		const id = ctx.model?.id.split("/").at(-1) ?? "";
 		const family = /^gpt-/i.test(id) ? "gpt" : /^claude-fable(?:-|$)/i.test(id) ? "fable" : undefined;
-		const config = existsSync(CONFIG_FILE) ? JSON.parse(readFileSync(CONFIG_FILE, "utf8")) : {};
+		const config: unknown = existsSync(CONFIG_FILE) ? JSON.parse(readFileSync(CONFIG_FILE, "utf8")) : {};
+		if (!isObject(config)) throw new Error("Invalid YSK config: " + CONFIG_FILE);
 		const route = family ? config[family] : undefined;
+		if (route !== undefined && !isObject(route)) throw new Error("Invalid YSK route: " + CONFIG_FILE);
+		const level = route?.thinking;
+		const thinking = thinkingLevels.find((value) => value === level);
+		if (level !== undefined && thinking === undefined) throw new Error("Invalid YSK thinking level in " + CONFIG_FILE);
 		const override = process.env.YSK_MODEL?.trim();
 		if (!override && !route) return { model: ctx.model, thinking: undefined };
 		const requested = override || route?.model || (ctx.model && `${ctx.model.provider}/${ctx.model.id}`);
@@ -335,8 +344,6 @@ export default function (pi: ExtensionAPI) {
 		const at = requested.indexOf("/");
 		const model = ctx.modelRegistry.find(requested.slice(0, at), requested.slice(at + 1));
 		if (!model) throw new Error(`YSK model not found: ${requested}`);
-		const thinking = route?.thinking;
-		if (thinking !== undefined && !thinkingLevels.includes(thinking)) throw new Error("Invalid YSK thinking level in " + CONFIG_FILE);
 		// A route to the main model at the main level is the cached same-model request.
 		if (isMain(ctx, model) && (thinking === undefined || thinking === pi.getThinkingLevel())) return { model, thinking: undefined };
 		return { model, thinking };
@@ -366,7 +373,7 @@ export default function (pi: ExtensionAPI) {
 	// shows every note (no key hint line: alt+x dismisses, /ysk or alt+shift+y responds).
 	// In fullscreen mode, clicking a note opens it: evidence, explanation and a row of buttons.
 	type Row = { note?: Note; hits?: Hit<Act>[] };
-	const notesWidget = (ctx: ExtensionContext, theme: any): Component => {
+	const notesWidget = (ctx: ExtensionContext, theme: Theme): Component => {
 		let rows: Row[] = [];
 		return {
 			render(width: number) {
@@ -553,7 +560,7 @@ export default function (pi: ExtensionAPI) {
 		log({ event: "answer", answer, via: "mouse", explained: !!explanation, line: n.line, msToAnswer: Date.now() - n.shownAt });
 	}
 
-	async function fork(ctx: ExtensionContext, llmMessages: any[], prompt: string, signal: AbortSignal) {
+	async function fork(ctx: ExtensionContext, llmMessages: Message[], prompt: string, signal: AbortSignal) {
 		const { model, thinking } = pickModel(ctx);
 		if (!model) throw new Error("no model");
 		const same = isMain(ctx, model) && thinking === undefined;
@@ -562,60 +569,51 @@ export default function (pi: ExtensionAPI) {
 			{ role: "user" as const, content: [{ type: "text" as const, text: prompt }], timestamp: Date.now() },
 		];
 		const hasSystem = llmMessages[0]?.role === "system";
-		const context = { messages, ...(hasSystem ? {} : { systemPrompt: ctx.getSystemPrompt() }) } as any;
+		const context: Context = { messages, ...(hasSystem ? {} : { systemPrompt: ctx.getSystemPrompt() }) };
+		let aligned: Aligned = { align: { aligned: false, why: "independent side request" } };
 		const options = {
 			signal, sessionId: ctx.sessionManager.getSessionId(),
 			onPayload: (p: unknown) => {
 				// Cache alignment copies the main request (tools, system, thinking), so it must
 				// not overwrite a routed model's converted history or its own thinking setting.
-				if (same) return alignWithMain(p);
-				lastAlign = { aligned: false, why: "independent side request" };
-				return undefined;
+				if (same) aligned = alignWithMain(payload(p));
+				const sent = aligned.payload ?? p;
+				if (isObject(sent)) forkPayloads.add(sent);
+				return aligned.payload;
 			},
 		};
 		// The same-model request reuses the main request's payload. Routes use Pi's neutral
 		// thinking option, translated by each provider to its native wire format.
 		const res = same
 			? await ctx.modelRegistry.complete(model, context, options)
-			: await ctx.modelRegistry.streamSimple(model, context, { ...options, reasoning: thinking, toolChoice: "none" }).result();
-		const cache = DEBUG && same && res.stopReason !== "error" ? cacheCheck(ctx, res.usage) : undefined;
-		return { text: textOf(res), usage: res.usage, stopReason: res.stopReason, error: res.errorMessage, provider: model.provider, model: model.id, thinking, cache };
+			: await ctx.modelRegistry.streamSimple(model, context, { ...options, reasoning: thinking === "off" ? undefined : thinking, toolChoice: "none" }).result();
+		const cache = DEBUG && res.stopReason !== "error" ? cacheCheck(ctx, res.usage, aligned.copiedMain) : undefined;
+		const text = res.content.filter((c) => c.type === "text").map((c) => c.text).join("\n").trim();
+		return { text, usage: res.usage, stopReason: res.stopReason, error: res.errorMessage, provider: model.provider, model: model.id, thinking, cache, align: aligned.align };
 	}
 
-	let lastLlmMessages: any[] = [];
+	let lastLlmMessages: Message[] = [];
 
-	/**
-	 * The main conversation's last request, exactly as sent. The fork is only
-	 * cheap if its bytes start the same way, and they did not: it sent no tools
-	 * and no thinking setting, so Anthropic kept the tools and system prompt
-	 * cached but wrote every message again — about 255k tokens and $1.30 per
-	 * check on Opus 5.5 (155 checks, $56.76 in checks.jsonl before this fix).
-	 */
-	let mainPayload: Record<string, unknown> | undefined;
+	type CheckDetails = Partial<Omit<Awaited<ReturnType<typeof fork>>, "text">> & { waiting?: number; settled?: number; line?: string };
+	// Preserve tools, system and thinking as well as messages for cache reuse.
+	let mainPayload: Payload | undefined;
 	const forkPayloads = new WeakSet<object>();
 	pi.on("before_provider_request", (e) => {
 		const p = e.payload;
-		if (!p || typeof p !== "object" || forkPayloads.has(p as object)) return; // never align to our own fork
-		mainPayload = p as Record<string, unknown>;
+		if (isObject(p) && forkPayloads.has(p)) return;
+		mainPayload = payload(p);
 	});
 
-	/**
-	 * YSK_DEBUG only: is a same-model check actually reading the main request's cache?
-	 * A check repeats the beginning of the main request it copied, so it should read from
-	 * cache at least everything that main request read or wrote there. Less means the
-	 * copy differs from what was sent, usually because another extension changes requests
-	 * after this one sees them (Pi runs request hooks in extension load order).
-	 */
+	// Compare cache usage only when the fork retained the entire main prefix.
 	const cachedByMain = new WeakMap<object, number>();
-	let copiedMain: object | undefined; // the main request the last same-model check copied
 	pi.on("message_end", (e) => {
-		const usage = (e.message as any)?.role === "assistant" ? (e.message as any).usage : undefined;
-		if (DEBUG && usage && mainPayload) cachedByMain.set(mainPayload, (usage.cacheRead ?? 0) + (usage.cacheWrite ?? 0));
+		const usage = e.message.role === "assistant" ? e.message.usage : undefined;
+		if (DEBUG && usage && mainPayload) cachedByMain.set(mainPayload, usage.cacheRead + usage.cacheWrite);
 	});
-	const cacheCheck = (ctx: ExtensionContext, usage: any) => {
+	const cacheCheck = (ctx: ExtensionContext, usage: Usage, copiedMain?: Payload) => {
 		const expected = copiedMain && cachedByMain.get(copiedMain);
 		if (!expected) return undefined; // the copied request is still streaming, or cached nothing
-		const read = usage?.cacheRead ?? 0;
+		const read = usage.cacheRead;
 		if (read < expected)
 			ctx.ui.notify(
 				`you-should-know: a check read ${read} tokens from cache, fewer than the ${expected} the main request had there. Another extension may change requests after this one copies them.`,
@@ -624,77 +622,60 @@ export default function (pi: ExtensionAPI) {
 		return { read, expected, ok: read >= expected };
 	};
 
-	/** How the last fork lined up with the main request; logged with each check. */
-	let lastAlign: Record<string, unknown> = {};
-
-	/**
-	 * Cache fix, take two. The first version rebuilt the fork's messages and moved
-	 * the cache marker to the message before the detect prompt. Anthropic only finds
-	 * a cached prefix by looking back about 20 content blocks from a marker, and
-	 * most checks landed outside that window: checks.jsonl showed ~21k tokens read
-	 * (tools + system only) and 130-300k written, about $1 per check.
-	 *
-	 * Now the fork reuses the main request's message list byte for byte, including
-	 * its cache marker, so the fork reads exactly what the main request cached. The
-	 * messages after it (the turn that just ended) and the detect prompt carry no
-	 * marker: they are paid once as plain input and never written to the cache.
-	 */
-	const alignWithMain = (forked: unknown): unknown => {
+	// Keep main's cache markers: moving them beyond Anthropic's lookback window loses
+	// the cached prefix. New messages and the side prompt remain unmarked.
+	const alignWithMain = (f: Payload | undefined): Aligned => {
 		const main = mainPayload;
-		lastAlign = { aligned: false };
-		copiedMain = undefined;
-		if (!main || !forked || typeof forked !== "object") return markFork(undefined, (lastAlign.why = "no main payload"));
-		const f = forked as Record<string, unknown>;
-		if (main["model"] !== f["model"]) return markFork(undefined, (lastAlign.why = "model differs"));
-		const key = Array.isArray(f["messages"]) ? "messages" : Array.isArray(f["input"]) ? "input" : undefined;
-		if (!key || !Array.isArray(main[key])) return markFork(undefined, (lastAlign.why = "no message list"));
-		copiedMain = main;
-		if (key === "input") return markFork({ ...main, input: f["input"] }, undefined, true);
-		const mainMsgs = main[key] as any[];
-		const forkMsgs = (f[key] as any[]).map(unmark);
+		if (!main || !f) return { align: { aligned: false, why: "no main payload" } };
+		if (main.model !== f.model) return { align: { aligned: false, why: "model differs" } };
+		if (main.input && f.input) return {
+			payload: { ...main, input: f.input }, align: { aligned: true },
+			copiedMain: JSON.stringify(main.input) === JSON.stringify(f.input.slice(0, main.input.length)) ? main : undefined,
+		};
+		if (!main.messages || !f.messages) return { align: { aligned: false, why: "no message list" } };
+		const mainMsgs = main.messages;
+		const forkMsgs = f.messages.map(unmark);
 		// Another extension may put messages in front of the main request after Pi builds it (the
 		// Anthropic OAuth fix moves the system prompt into a leading user message), so the fork's
 		// first message can match a later one in main. Main's leading messages are kept as sent.
 		const { lead, common } = alignment(mainMsgs, forkMsgs);
 		const same = lead + common;
-		lastAlign = { aligned: true, mainLen: mainMsgs.length, forkLen: forkMsgs.length, lead, common };
-		if (common === 0) return markFork({ ...main, messages: forkMsgs }, undefined, true);
+		const align = { aligned: true, mainLen: mainMsgs.length, forkLen: forkMsgs.length, lead, common };
+		if (common === 0) return { payload: { ...main, messages: forkMsgs }, align };
 		const head = mainMsgs.slice(0, same);
 		if (same < mainMsgs.length) {
 			// Main's marker fell outside the match: put the same marker on the last
 			// matching message so Anthropic can still look back to main's cache.
 			const marker = findMarker(mainMsgs) ?? { type: "ephemeral" };
 			const last = unmark(head[same - 1]);
-			if (Array.isArray(last?.content) && last.content.length > 0) {
+			if (Array.isArray(last.content)) {
 				const blocks = last.content.slice();
-				const at = blocks.findLastIndex((b: any) => b?.type !== "thinking" && b?.type !== "redacted_thinking");
+				const at = blocks.findLastIndex((b) => b.type !== "thinking" && b.type !== "redacted_thinking");
 				if (at >= 0) blocks[at] = { ...blocks[at], cache_control: marker };
 				head[same - 1] = { ...last, content: blocks };
 			}
 		}
 		// Main's own messages (marker included), then the new tail, unmarked.
-		return markFork({ ...main, messages: [...head, ...forkMsgs.slice(common)] }, undefined, true);
+		return { payload: { ...main, messages: [...head, ...forkMsgs.slice(common)] }, align,
+			copiedMain: same === mainMsgs.length ? main : undefined };
 	};
-	const markFork = (payload: Record<string, unknown> | undefined, _why?: string, _aligned?: boolean) => {
-		if (payload) forkPayloads.add(payload);
-		return payload;
-	};
-	const unmark = (m: any) =>
-		Array.isArray(m?.content) ? { ...m, content: m.content.map(({ cache_control: _drop, ...b }: any) => b) } : m;
-	const sameMsg = (a: any, b: any) => JSON.stringify(unmark(a)) === JSON.stringify(unmark(b));
-	const findMarker = (msgs: any[]) => {
-		for (let i = msgs.length - 1; i >= 0; i--)
-			for (const b of Array.isArray(msgs[i]?.content) ? msgs[i].content : []) if (b?.cache_control) return b.cache_control;
+	const unmark = (m: WireMessage): WireMessage =>
+		Array.isArray(m.content) ? { ...m, content: m.content.map(({ cache_control: _drop, ...b }) => b) } : m;
+	const findMarker = (msgs: WireMessage[]) => {
+		for (let i = msgs.length - 1; i >= 0; i--) {
+			const content = msgs[i].content;
+			if (Array.isArray(content)) for (const b of content) if (b.cache_control) return b.cache_control;
+		}
 		return undefined;
 	};
 	/** How many messages match, once cache markers are ignored, when the fork starts at main[lead]. */
-	const commonFrom = (main: any[], fork: any[], lead: number) => {
+	const commonFrom = (main: WireMessage[], fork: WireMessage[], lead: number) => {
 		let i = 0;
-		while (lead + i < main.length && i < fork.length && sameMsg(main[lead + i], fork[i])) i++;
+		while (lead + i < main.length && i < fork.length && JSON.stringify(unmark(main[lead + i])) === JSON.stringify(fork[i])) i++;
 		return i;
 	};
 	/** The number of messages main has in front of the fork's first message, and how many match from there. */
-	const alignment = (main: any[], fork: any[]) => {
+	const alignment = (main: WireMessage[], fork: WireMessage[]) => {
 		let best = { lead: 0, common: commonFrom(main, fork, 0) };
 		for (let lead = 1; lead < main.length && best.common < main.length - lead; lead++) {
 			const common = commonFrom(main, fork, lead);
@@ -757,6 +738,9 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	pi.on("session_start", (_e, ctx) => {
+		sessionGeneration++;
+		mainPayload = undefined;
+		lastLlmMessages = [];
 		state = loadState();
 		queuedRelays.clear();
 		inFlight?.abort();
@@ -793,6 +777,7 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("session_shutdown", () => {
+		sessionGeneration++;
 		inFlight?.abort();
 		inFlight = undefined;
 		if (inboxTimer) clearInterval(inboxTimer);
@@ -833,7 +818,7 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("turn_end", (e, ctx) => {
-		lastLlmMessages = e.context.llmMessages as any[];
+		lastLlmMessages = e.context.llmMessages;
 		turnCount++;
 		if (!state.enabled || !ctx.hasUI) return;
 		const step = e.turnIndex;
@@ -860,23 +845,21 @@ export default function (pi: ExtensionAPI) {
 		// Fire and forget: never block the main agent.
 		inFlightTask = (async () => {
 			let outcome = "error";
-			let extra: Record<string, unknown> = {};
+			let extra: CheckDetails = {};
 			try {
-				const r = await fork(ctx, lastLlmMessages, detectPrompt(seen, known, waiting, queueFull), ac.signal);
-				extra = { usage: r.usage, stopReason: r.stopReason, error: r.error, provider: r.provider, model: r.model, thinking: r.thinking, cache: r.cache, waiting: waiting.length };
-				if (ac.signal.aborted || r.stopReason === "aborted") outcome = "aborted";
-				else if (r.stopReason === "error") outcome = "error";
-				else if (!r.text) outcome = "empty";
+				const { text, ...result } = await fork(ctx, lastLlmMessages, detectPrompt(seen, known, waiting, queueFull), ac.signal);
+				extra = { ...result, waiting: waiting.length };
+				if (ac.signal.aborted || result.stopReason === "aborted") outcome = "aborted";
+				else if (result.stopReason === "error") outcome = "error";
+				else if (promptCounter !== askedAt) outcome = "stale";
+				else if (!text) outcome = "empty";
 				else {
-					if (waiting.length > 0) {
-						const settled = parseSettled(r.text, waiting);
-						extra.settled = settled.length;
-						settle(ctx, settled, "check");
-					}
-					const p = parse(r.text);
+					const settled = parseSettled(text, waiting);
+					extra.settled = settled.length;
+					settle(ctx, settled, "check");
+					const p = parse(text);
 					if (p.kind !== "line") outcome = p.kind;
-					else if ([...seen, ...known].some((x) => norm(x) === norm(p.line))) outcome = "deduped";
-					else if (promptCounter !== askedAt) outcome = "stale";
+					else if ([...seen, ...known, ...waiting.map((n) => n.line)].some((x) => norm(x) === norm(p.line))) outcome = "deduped";
 					else if (ctx.mode === "tui" && !CHILD_INBOX && notes.length >= MAX_NOTES) {
 						// Not added to seen, so a later check can raise it once there is room.
 						outcome = "queue_full";
@@ -916,7 +899,7 @@ export default function (pi: ExtensionAPI) {
 				extra.error = String(err);
 			} finally {
 				if (inFlight === ac) inFlight = undefined;
-				log({ event: "check", step, outcome, ms: Date.now() - t0, align: lastAlign, ...extra });
+				log({ event: "check", step, outcome, ms: Date.now() - t0, ...extra });
 				if (DEBUG) ctx.ui.notify(`you-should-know: step ${step} \u2192 ${outcome} (${Date.now() - t0}ms)`, "info");
 			}
 		})();
@@ -925,29 +908,32 @@ export default function (pi: ExtensionAPI) {
 	// When the run ends, ask once more which waiting notes the agent has since dealt with,
 	// unless the last check already saw the final step. A check still running finishes first.
 	pi.on("agent_before_settle", (e, ctx) => {
-		lastLlmMessages = e.context.llmMessages as any[];
-		if (!state.enabled || ctx.mode !== "tui" || CHILD_INBOX || notes.length === 0 || askedAtTurn === turnCount) return;
+		lastLlmMessages = e.context.llmMessages;
+		if (!state.enabled || ctx.mode !== "tui" || CHILD_INBOX) return;
 		void settleAtEnd(ctx, lastLlmMessages);
 	});
 
-	async function settleAtEnd(ctx: ExtensionContext, messages: any[]) {
+	async function settleAtEnd(ctx: ExtensionContext, messages: Message[]) {
+		const generation = sessionGeneration, askedAt = promptCounter, turn = turnCount;
 		await inFlightTask;
-		if (inFlight || notes.length === 0 || askedAtTurn === turnCount) return;
+		if (generation !== sessionGeneration || askedAt !== promptCounter || turn !== turnCount || !state.enabled ||
+			inFlight || notes.length === 0 || askedAtTurn === turnCount) return;
 		const ac = new AbortController();
 		inFlight = ac;
 		askedAtTurn = turnCount;
 		const waiting = waitingNotes();
 		const t0 = Date.now();
 		let outcome = "error";
-		let extra: Record<string, unknown> = {};
+		let extra: CheckDetails = {};
 		inFlightTask = (async () => {
 			try {
-				const r = await fork(ctx, messages, settlePrompt(waiting), ac.signal);
-				extra = { usage: r.usage, stopReason: r.stopReason, error: r.error, provider: r.provider, model: r.model, thinking: r.thinking, cache: r.cache };
-				if (ac.signal.aborted || r.stopReason === "aborted") outcome = "aborted";
-				else if (r.stopReason === "error") outcome = "error";
+				const { text, ...result } = await fork(ctx, messages, settlePrompt(waiting), ac.signal);
+				extra = result;
+				if (ac.signal.aborted || result.stopReason === "aborted") outcome = "aborted";
+				else if (result.stopReason === "error") outcome = "error";
+				else if (promptCounter !== askedAt || turnCount !== turn) outcome = "stale";
 				else {
-					const settled = parseSettled(r.text, waiting);
+					const settled = parseSettled(text, waiting);
 					extra.settled = settled.length;
 					settle(ctx, settled, "end");
 					outcome = "done";
@@ -957,7 +943,7 @@ export default function (pi: ExtensionAPI) {
 				extra.error = String(err);
 			} finally {
 				if (inFlight === ac) inFlight = undefined;
-				log({ event: "settle", outcome, waiting: waiting.length, ms: Date.now() - t0, align: lastAlign, ...extra });
+				log({ event: "settle", outcome, waiting: waiting.length, ms: Date.now() - t0, ...extra });
 				if (DEBUG) ctx.ui.notify(`you-should-know: settle \u2192 ${outcome}, ${extra.settled ?? 0} of ${waiting.length} (${Date.now() - t0}ms)`, "info");
 			}
 		})();
@@ -971,7 +957,7 @@ export default function (pi: ExtensionAPI) {
 			text = (await fork(ctx, lastLlmMessages, explainPrompt(n.line), new AbortController().signal)).text;
 		}
 		while (true) {
-			const choice = ctx.mode !== "tui" ? await explainBySelect(ctx, n, text!) : await ctx.ui.custom<string>((_tui, theme, _kb, done) => {
+			const choice = await ctx.ui.custom<string>((_tui, theme, _kb, done) => {
 				const c = new Container();
 				const border = new DynamicBorder((s: string) => theme.fg("accent", s));
 				c.addChild(border);
@@ -1013,14 +999,6 @@ export default function (pi: ExtensionAPI) {
 			if (choice === "chat") chatInMain(n, text);
 			return;
 		}
-	}
-
-	// Outside the terminal UI: the explanation as a notice, then the same choices as a select.
-	const EXPLAIN_OPTIONS = { Understood: "understood", "Chat in main session": "chat", "Simpler words": "simpler_words", "Less detail": "less_detail", "More detail": "more_detail" } as const;
-	async function explainBySelect(ctx: ExtensionContext, n: Note, text: string) {
-		ctx.ui.notify(`${n.tag} \u00b7 ${n.line}\n\n${text}`, "info");
-		const pick = await ctx.ui.select(`${n.tag} \u00b7 ${n.line}`, Object.keys(EXPLAIN_OPTIONS));
-		return pick ? EXPLAIN_OPTIONS[pick as keyof typeof EXPLAIN_OPTIONS] : "dismiss";
 	}
 
 	// CC's un(): quote the note into the main session.
