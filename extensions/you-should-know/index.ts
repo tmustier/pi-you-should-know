@@ -120,7 +120,7 @@ function log(entry: Record<string, unknown>) {
 
 // ---- output parsing (the CC mod's Cr()) ----
 type Tag = "You should know" | "Heads up";
-type Note = { id: string; line: string; tag: Tag; evidence?: string; explanation?: string; from?: string; shownAt: number; promptsSurvived: number; countedIgnored?: boolean; step?: number };
+type Note = { id: string; line: string; tag: Tag; evidence?: string; explanation?: string; from?: string; shownAt: number; promptsSurvived: number; step?: number };
 type Parsed = { kind: "none" } | { kind: "parse_failed" } | { kind: "line"; line: string; tag: Tag; evidence?: string; explanation?: string };
 const strip = (s: string) => s.replace(/^[\s>*_`"'\u201C\u201D\u2018\u2019-]+/, "");
 function parse(text: string): Parsed {
@@ -279,8 +279,8 @@ export default function (pi: ExtensionAPI) {
 	let answered = new Map<string, Note>();
 	let inFlight: AbortController | undefined;
 	let inFlightTask: Promise<void> | undefined;
-	let promptCounter = 0; // stands in for CC's turnId staleness check
-	let sessionGeneration = 0;
+	// Counts user prompts and session changes (CC's turnId): a side answer asked before the latest one is stale.
+	let promptCounter = 0;
 	let checks = 0;
 	// Steps seen this process, and the step the last side request looked at. A note remembers
 	// the step it was raised at, so a later request can tell how long it has been waiting.
@@ -686,7 +686,7 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	pi.on("session_start", (_e, ctx) => {
-		sessionGeneration++;
+		promptCounter++;
 		mainPayload = undefined;
 		lastLlmMessages = [];
 		state = loadState();
@@ -710,7 +710,6 @@ export default function (pi: ExtensionAPI) {
 		} catch (error) {
 			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
 		}
-		promptCounter = 0;
 		turnCount = 0;
 		askedAtTurn = 0;
 		inFlightTask = undefined;
@@ -725,7 +724,7 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("session_shutdown", () => {
-		sessionGeneration++;
+		promptCounter++;
 		inFlight?.abort();
 		inFlight = undefined;
 		if (inboxTimer) clearInterval(inboxTimer);
@@ -753,8 +752,7 @@ export default function (pi: ExtensionAPI) {
 		const visible = ctx.mode === "tui" && !showAll ? notes.filter((n) => n === current()) : notes;
 		for (const n of visible) {
 			n.promptsSurvived++;
-			if (n.countedIgnored || n.promptsSurvived < PROMPTS_SURVIVED) continue;
-			n.countedIgnored = true;
+			if (n.promptsSurvived !== PROMPTS_SURVIVED) continue;
 			log({ event: "ignored_submit", line: n.line });
 			state.ignoredInARow++;
 			changed = true;
@@ -858,12 +856,12 @@ export default function (pi: ExtensionAPI) {
 		lastLlmMessages = e.context.llmMessages;
 		if (!state.enabled || ctx.mode !== "tui" || CHILD_INBOX) return;
 		const messages = lastLlmMessages;
-		const generation = sessionGeneration, askedAt = promptCounter, turn = turnCount;
+		const askedAt = promptCounter, turn = turnCount;
 		const pending = inFlightTask;
 		// Do not return this promise: Pi must reach idle while side requests finish.
 		inFlightTask = (async () => {
 			await pending;
-			if (generation !== sessionGeneration || askedAt !== promptCounter || turn !== turnCount || !state.enabled ||
+			if (askedAt !== promptCounter || turn !== turnCount || !state.enabled ||
 				inFlight || notes.length === 0 || askedAtTurn === turnCount) return;
 			const ac = new AbortController();
 			inFlight = ac;
