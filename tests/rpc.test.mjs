@@ -94,6 +94,7 @@ test('a client’s knew answer only dismisses, and an old known list is dropped'
       const events = readFileSync(join(f.agentDir, 'you-should-know/checks.jsonl'), 'utf8').trim().split('\n').map(JSON.parse);
       assert.equal(events.at(-1).event, 'answer');
       assert.equal(events.at(-1).answer, 'dismiss');
+      assert.equal(events.at(-1).line, 'This is a test note from /ysk test.');
       await client.close();
     }
   } finally { await f.close(); }
