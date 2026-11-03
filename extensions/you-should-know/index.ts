@@ -31,7 +31,6 @@ const FREE_IGNORES = 2; // var ut=2
 const HISTORY_MAX = 50; // var $t=50
 const MAX_NOTES = 5; // local: notes queue until answered; new notes wait while the queue is full
 const UNDO_MS = 5000; // agent-default (not a user rule): 2026-10-05. How long "Dismissed · Undo" stays after a click.
-const MIN_NOTE_TEXT = 20; // agent-default (not a user rule): 2026-11-03. Narrower than this, a note's buttons move below its text.
 const backoff = (ignoredInARow: number) =>
 	ignoredInARow <= FREE_IGNORES ? 0 : Math.min(MAX_SKIP, 2 ** (ignoredInARow - FREE_IGNORES - 1)); // kn()
 
@@ -231,6 +230,7 @@ const LINE_BUTTONS: Button<Act>[] = [
 	{ label: "Ask agent", action: "ask" },
 	{ label: "\u00d7", action: "dismiss", dim: true },
 ];
+const LINE_BUTTONS_WIDTH = LINE_BUTTONS.reduce((w, b, i) => w + visibleWidth(`[${b.label}]`) + (i > 0 ? 2 : 0), 0);
 // Under an open note: Explain, then the same answers again below the explanation.
 const OPEN_BUTTONS: Button<Act>[] = [{ label: "Explain", action: "explain" }];
 const EXPLAINED_BUTTONS: Button<Act>[] = [
@@ -362,17 +362,17 @@ export default function (pi: ExtensionAPI) {
 					const tag = on ? theme.fg("accent", theme.bold(n.tag)) : theme.fg("dim", n.tag);
 					const from = n.from ? theme.fg("dim", ` (${n.from})`) : "";
 					const text = mark + tag + from + theme.fg("dim", " \u00b7 ") + n.line;
-					const inline = layoutButtons(LINE_BUTTONS, width, 0, theme);
-					const buttonsWidth = visibleWidth(inline.lines[0]);
-					if (width - buttonsWidth - 2 >= MIN_NOTE_TEXT) {
-						// The buttons end the note's last line; the text wraps short enough to leave room.
-						const wrapped = wrapTextWithAnsi(text, width - buttonsWidth - 2);
-						const last = wrapped.pop()!;
-						add(wrapped, { note: n, opens: true });
-						const x = visibleWidth(last) + 2;
+					// The text wraps at full width. The buttons follow its last line when they fit there,
+					// otherwise they get a line of their own.
+					const wrapped = wrapTextWithAnsi(text, width);
+					const last = wrapped.at(-1)!;
+					const x = visibleWidth(last) + 2;
+					if (x + LINE_BUTTONS_WIDTH <= width) {
+						const inline = layoutButtons(LINE_BUTTONS, width, 0, theme);
+						add(wrapped.slice(0, -1), { note: n, opens: true });
 						add([last + "  " + inline.lines[0]], { note: n, opens: true, hits: inline.hits[0].map((h) => ({ ...h, x0: h.x0 + x, x1: h.x1 + x })) });
 					} else {
-						add(wrapTextWithAnsi(text, width), { note: n, opens: true });
+						add(wrapped, { note: n, opens: true });
 						const laid = layoutButtons(LINE_BUTTONS, width, 2, theme);
 						laid.lines.forEach((l, i) => add([l], { note: n, hits: laid.hits[i] }));
 					}

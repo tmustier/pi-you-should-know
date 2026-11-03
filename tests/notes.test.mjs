@@ -94,5 +94,11 @@ test('each note ends with Ask agent and × buttons that answer it in one click',
   await command('test', ctx);
   click('test note', '[×]');
   assert.deepEqual(widget.render(100), ['  Dismissed · Undo']);
+  // When the last line has no room left, the buttons get a line of their own.
+  await command('test', ctx);
+  const narrow = widget.render(50);
+  assert.deepEqual(narrow.slice(0, 2), ['✦ Heads up · This is a test note from /ysk test.', '  [Ask agent]  [×]']);
+  widget.handleMouse({ type: 'click', button: 'left', x: narrow[1].indexOf('[×]') + 1, y: 1 });
+  assert.deepEqual(widget.render(50), ['  Dismissed · Undo']);
   handlers.get('session_shutdown')({}, ctx);
 });
