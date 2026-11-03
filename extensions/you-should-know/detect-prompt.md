@@ -76,9 +76,6 @@ Length: 1-2 sentences, about 20 words. Always end with a period. If 1 sentence, 
 These are the last suggestions offered to the user. You should skip them:
 {{SEEN}}
 
-The person said they already understood these topics, so make sure to avoid offering them:
-{{KNOWN}}
-
 #### Suggesting nothing
 
 Choose the most important, relevant, useful topic. If there is nothing clearly important, relevant, useful—DO NOT suggest anything! If nothing clears the bar, simply respond with:
