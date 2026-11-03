@@ -211,3 +211,20 @@ test('concurrent explanation cannot overwrite detection cache diagnostics', asyn
   assert.ok(!s.notices.some((n) => n.includes('fewer than')));
   s.close();
 });
+
+
+test('a failed inline explanation offers Explain again and can be retried', async () => {
+  const s = open('explanation-retry');
+  s.replies.push('learn: A note without an explanation.\ntag: Heads up');
+  await s.turns(6);
+  await s.click(3, 0);
+  s.replies.push({ then: (_resolve, reject) => reject(new Error('model unavailable')) });
+  await s.click(3, 1);
+  assert.ok(s.lines().some((line) => line.includes('model unavailable')));
+  assert.equal(s.lines().at(-1).trim(), '[Explain]');
+  s.replies.push('The explanation is available now.');
+  await s.click(3, s.lines().length - 1);
+  assert.equal(s.lines().at(-1).trim(), '[Ask agent]  [Dismiss]');
+  assert.ok(!s.lines().some((line) => line.includes('model unavailable')));
+  s.close();
+});

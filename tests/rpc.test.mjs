@@ -76,12 +76,26 @@ test('a client’s knew answer only dismisses, and an old known list is dropped'
   try {
     mkdirSync(join(f.agentDir, 'you-should-know'), { recursive: true });
     writeFileSync(join(f.agentDir, 'you-should-know/state.json'), JSON.stringify({ enabled: true, seen: [], known: ['An old Knew it answer.'], ignoredInARow: 0, skip: 0 }));
-    const client = await f.open();
+    let client = await f.open();
     const id = await testNoteId(client);
     await client.command(`/ysk answer ${id} knew`);
     assert.equal('known' in f.state(), false);
     const log = readFileSync(join(f.agentDir, 'you-should-know/checks.jsonl'), 'utf8').trim().split('\n').map((line) => JSON.parse(line));
     assert.equal(log.at(-1).answer, 'dismiss');
+    await client.close();
+    const file = join(f.root, 'artifacts', client.session.sessionId, 'you-should-know.json');
+    const saved = JSON.parse(readFileSync(file, 'utf8'));
+    saved.answered = saved.answered.map(([id, note]) => [id, { note, action: 'knew' }]);
+    writeFileSync(file, JSON.stringify(saved));
+    for (let i = 0; i < 2; i++) {
+      client = await f.open();
+      await client.command(`/ysk answer ${id} undo`);
+      await client.command(`/ysk answer ${id} dismiss`);
+      const events = readFileSync(join(f.agentDir, 'you-should-know/checks.jsonl'), 'utf8').trim().split('\n').map(JSON.parse);
+      assert.equal(events.at(-1).event, 'answer');
+      assert.equal(events.at(-1).answer, 'dismiss');
+      await client.close();
+    }
   } finally { await f.close(); }
 });
 
