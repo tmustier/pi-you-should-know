@@ -71,32 +71,17 @@ const testNoteId = async (client) => {
   return note.message.match(/\[ysk:([^\]]+)\]/)[1];
 };
 
-test('Knew and Undo survive real Pi process restarts', async () => {
+test('a client’s knew answer only dismisses, and an old known list is dropped', async () => {
   const f = fixture();
   try {
-    let client = await f.open();
+    mkdirSync(join(f.agentDir, 'you-should-know'), { recursive: true });
+    writeFileSync(join(f.agentDir, 'you-should-know/state.json'), JSON.stringify({ enabled: true, seen: [], known: ['An old Knew it answer.'], ignoredInARow: 0, skip: 0 }));
+    const client = await f.open();
     const id = await testNoteId(client);
-    await client.close(); client = await f.open();
     await client.command(`/ysk answer ${id} knew`);
-    assert.ok(f.state().known.includes('This is a test note from /ysk test.'));
-    await client.close(); client = await f.open();
-    await client.command(`/ysk answer ${id} undo`);
-    assert.ok(!f.state().known.includes('This is a test note from /ysk test.'));
-  } finally { await f.close(); }
-});
-
-test('a stale Pi process cannot erase another session’s Knew or resurrect its Undo', async () => {
-  const f = fixture();
-  try {
-    const stale = await f.open('stale');
-    const writer = await f.open('writer');
-    const id = await testNoteId(writer);
-    await writer.command(`/ysk answer ${id} knew`);
-    await stale.command('/ysk off');
-    assert.ok(f.state().known.includes('This is a test note from /ysk test.'));
-    await writer.command(`/ysk answer ${id} undo`);
-    await stale.command('/ysk on');
-    assert.ok(!f.state().known.includes('This is a test note from /ysk test.'));
+    assert.equal('known' in f.state(), false);
+    const log = readFileSync(join(f.agentDir, 'you-should-know/checks.jsonl'), 'utf8').trim().split('\n').map((line) => JSON.parse(line));
+    assert.equal(log.at(-1).answer, 'dismiss');
   } finally { await f.close(); }
 });
 

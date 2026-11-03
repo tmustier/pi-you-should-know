@@ -9,21 +9,21 @@ It's a port of the "you should know" plugin built into Claude Code.
 ## Using it
 
 - A note shows up above the editor, like `✦ Heads up · The agent loosened the test threshold from 0.8 to 0.65.` One note shows at a time. When more are waiting, `2 more waiting` appears under it; click that in fullscreen mode to see them all.
-- `/ysk` or alt+shift+y: open the top note. You can learn more about it, mark it as something you knew, send it to the agent or dismiss it.
+- `/ysk` or alt+shift+y: open the top note. You can have it explained, send it to the agent or dismiss it.
 - alt+x: dismiss the top note.
-- In fullscreen mode, click a note to open it under its line. It shows the evidence (a link, when the evidence is a file) and buttons: Explain, Knew it, Ask agent and Dismiss. After Explain, the explanation appears in place with Got it, Simpler, Shorter and More detail. You can keep typing while a note is open. Knew it and Dismiss show Undo for 5 seconds. The open note is the one `/ysk` and alt+x act on. Dragging across a note still selects its text.
-- The explanation screen opened from `/ysk` shows its choices as buttons, which you can click or press the key shown.
+- In fullscreen mode, each note ends with `[Ask agent]  [×]`: one click sends it to the agent or dismisses it. Dismissing shows Undo for 5 seconds. Click the note's text to open it under its line: it shows the evidence (a link, when the evidence is a file) and an Explain button. The explanation appears in place, with Ask agent and Dismiss below it. You can keep typing while a note is open. The open note is the one `/ysk` and alt+x act on. Dragging across a note still selects its text.
+- The explanation screen opened from `/ysk` shows Ask agent and Dismiss as buttons, which you can click or press the key shown. Enter and Esc dismiss.
 - `/ysk off`, `/ysk on`, `/ysk status`: turn it off and on, or see how many checks it has run.
 
 Notes leave on their own when the agent deals with them. Each later check, and one more when the agent finishes, is asked which waiting notes the agent has since fixed, investigated or told you about; those disappear (the note you have open stays). The checks also skip anything the agent has only just come across, since it usually handles that itself. Up to 5 notes wait at once; while 5 are waiting, new notes are held back until there is room.
 
 If you keep ignoring notes, it checks less often. Answering any note resets that.
 
-Open notes and answer history are saved with the Pi session. Knew and Undo feedback is saved under `~/.pi/agent/you-should-know/` (or your `PI_CODING_AGENT_DIR`), so separate Pi sessions cannot overwrite one another’s feedback. Relayed child notes stay in the inbox until they appear in the parent’s saved conversation.
+Open notes and answer history are saved with the Pi session. The last 50 notes shown are saved under `~/.pi/agent/you-should-know/` (or your `PI_CODING_AGENT_DIR`), shared by every project, and later checks skip them. Relayed child notes stay in the inbox until they appear in the parent’s saved conversation.
 
 ## In RPC clients
 
-Without Pi's terminal UI (for example in T3 Code), each note is sent once as a notification in the form `[ysk:<id>] <tag> · <line> (<evidence>)`, followed by its explanation, so the client can show and answer it. The client reports each answer back with `/ysk answer <id> <action>` (`knew`, `dismiss`, `learn` or `send`); that removes the note silently and, for `knew`, remembers it as something you know. Notes are sent immediately, including between runs. T3 Code shows them in its heads-up band; `/ysk` points to those controls. Notes and answers survive a Pi restart. The client can undo an answer with `/ysk answer <id> undo`, which also removes a previous `knew` answer. Unanswered notes reduce the check frequency in RPC clients too.
+Without Pi's terminal UI (for example in T3 Code), each note is sent once as a notification in the form `[ysk:<id>] <tag> · <line> (<evidence>)`, followed by its explanation, so the client can show and answer it. The client reports each answer back with `/ysk answer <id> <action>` (`knew`, `dismiss`, `learn` or `send`); that removes the note silently. `knew` is treated as `dismiss`. Notes are sent immediately, including between runs. T3 Code shows them in its heads-up band; `/ysk` points to those controls. Notes and answers survive a Pi restart. The client can undo an answer with `/ysk answer <id> undo`. Unanswered notes reduce the check frequency in RPC clients too.
 
 ## With herdr subagents
 

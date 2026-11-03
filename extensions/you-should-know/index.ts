@@ -31,6 +31,7 @@ const FREE_IGNORES = 2; // var ut=2
 const HISTORY_MAX = 50; // var $t=50
 const MAX_NOTES = 5; // local: notes queue until answered; new notes wait while the queue is full
 const UNDO_MS = 5000; // agent-default (not a user rule): 2026-10-05. How long "Dismissed · Undo" stays after a click.
+const MIN_NOTE_TEXT = 20; // agent-default (not a user rule): 2026-11-03. Narrower than this, a note's buttons move below its text.
 const backoff = (ignoredInARow: number) =>
 	ignoredInARow <= FREE_IGNORES ? 0 : Math.min(MAX_SKIP, 2 ** (ignoredInARow - FREE_IGNORES - 1)); // kn()
 
@@ -39,7 +40,6 @@ const DETECT_TEMPLATE = readFileSync(join(HERE, "detect-prompt.md"), "utf8");
 const AGENT_DIR = process.env.PI_CODING_AGENT_DIR?.trim() || join(homedir(), ".pi", "agent");
 const CONFIG_FILE = join(AGENT_DIR, "you-should-know", "config.json");
 const STATE_FILE = join(AGENT_DIR, "you-should-know", "state.json");
-const KNOWLEDGE_FILE = join(AGENT_DIR, "you-should-know", "knowledge.jsonl");
 const LOG_FILE = join(AGENT_DIR, "you-should-know", "checks.jsonl");
 const WIDGET = "you-should-know";
 const DEBUG = !!process.env.YSK_DEBUG;
@@ -73,8 +73,8 @@ const TIMING_RULE =
 const SETTLED_RULE =
 	"A waiting note is settled when, after it was raised, the main agent dealt with it: it investigated, fixed or reverted the thing, made a deliberate decision about it, or told the user the same point plainly in its own words. A note is also settled when it is no longer true. Mentioning the topic in passing does not settle it. When unsure, leave the note waiting.";
 const SETTLED_FORMAT = "settled: <labels of the settled notes separated by commas, or none>";
-const detectPrompt = (seen: string[], known: string[], waiting: Waiting[] = [], queueFull = false) =>
-	DETECT_TEMPLATE.replace("{{SEEN}}", list(seen)).replace("{{KNOWN}}", list(known)) + // dn()
+const detectPrompt = (seen: string[], waiting: Waiting[] = [], queueFull = false) =>
+	DETECT_TEMPLATE.replace("{{SEEN}}", list(seen)) + // dn()
 	TIMING_RULE +
 	(waiting.length === 0
 		? ""
@@ -83,48 +83,17 @@ const detectPrompt = (seen: string[], known: string[], waiting: Waiting[] = [], 
 const settlePrompt = (waiting: Waiting[]) =>
 	`${PREAMBLE}\nAnswer straight away: do not think it over first, do not call any tool.\nThe main agent has just finished its work for now. These notes are waiting for the user, unanswered:\n${waitingList(waiting)}\n\n${SETTLED_RULE}\n\nOutput exactly one line:\n${SETTLED_FORMAT}`;
 
-type Direction = "first" | "simpler_words" | "less_detail" | "more_detail";
-const DIRECTION_ASK: Record<Exclude<Direction, "first">, string> = {
-	simpler_words: "in simpler words",
-	less_detail: "with less detail",
-	more_detail: "in more detail",
-};
-const DIRECTION_RULE: Record<Direction, string> = {
-	first: "At most 100 words; fewer when the thing needs no introduction.",
-	simpler_words:
-		"Same content as before, said more plainly: shorter sentences, everyday words, no symbols or arrows, no technical terms at all. At most 100 words.",
-	less_detail:
-		"Strip it to the single most important point: what the thing is in one clause, then the one consequence and the choice. No technical terms, no sketch. At most 45 words.",
-	more_detail:
-		"Now name the real parts: show the actual config keys, file or function involved (each introduced as everyday words then the name in backticks), and one edge case that would surprise them. Still for a reader with no context; still no invented terms. At most 160 words; a sketch of the real structure is welcome here if it helps.",
-};
-const shape = (rule: string) =>
+const SHAPE =
 	"Write for someone smart who knows nothing about this code and is context-switching constantly: assume they remember no term and no detail from earlier. One idea only. " +
-	rule +
+	"At most 100 words; fewer when the thing needs no introduction." +
 	'\nShape:\n1. A title line: `**` two to six plain words that state the point `**`.\n2. First sentence: what the thing IS, in everyday words, with a tiny example of what it does or produces (e.g. "a health check is a step that asks each server one question on a timer and saves the answer, like "are you still up? yes/no""). Never open with a name they have not used; never assume they know what it is.\n3. Then the before/after or the two options as two short lines, using their own numbers and names ("list it once at the top \u2192 asked 1\u00d7 \u2026 inside each job \u2192 asked 3\u00d7"). If, and only if, a small ASCII sketch shows this better than two lines of text, put one in a ``` fenced block, at most 60 characters wide and 6 lines tall; otherwise no sketch.\n4. Then the concrete consequence in their terms (a count, a cost, a wrong number they would have reported) and, last, the choice they are making, in one sentence.\nNo analogy unless it is genuinely clearer than the example, and never both. Any code name appears only after its everyday description, in backticks. Never coin a term or nickname. No headings other than the title, no bullets, no "in summary". Short words, short sentences.'; // pn()
-const explainPrompt = (line: string, prev?: { direction: Exclude<Direction, "first">; text: string }) =>
+const explainPrompt = (line: string) =>
 	`${PREAMBLE}\nAnswer straight away: do not think it over first, do not call any tool.\nThe person watching you work said yes to: "${line}"\n` +
-	(prev ? `You already showed them this, and they asked for it ${DIRECTION_ASK[prev.direction]}:\n${prev.text}\nDo not repeat it; rewrite it.\n` : "") +
-	shape(DIRECTION_RULE[prev?.direction ?? "first"]) +
+	SHAPE +
 	"\nOutput only the explanation."; // mn()
 
 // ---- persistent state (across sessions, like CC's plugin store) ----
-type State = { enabled: boolean; seen: string[]; known: string[]; ignoredInARow: number; skip: number };
-// Each feedback write is one append, so another Pi process cannot overwrite it
-// with an older in-memory snapshot. state.json remains the readable snapshot.
-function readKnowledge(legacy: string[]): string[] {
-	const known = new Map(legacy.map((line) => [norm(line), line]));
-	if (existsSync(KNOWLEDGE_FILE)) for (const line of readFileSync(KNOWLEDGE_FILE, "utf8").split("\n")) {
-		if (!line.trim()) continue;
-		try {
-			const entry = JSON.parse(line);
-			if (typeof entry.line !== "string" || typeof entry.known !== "boolean") continue;
-			if (entry.known) known.set(norm(entry.line), entry.line);
-			else known.delete(norm(entry.line));
-		} catch { /* An interrupted final append is ignored. The next starts on a new line. */ }
-	}
-	return [...known.values()].slice(-HISTORY_MAX);
-}
+type State = { enabled: boolean; seen: string[]; ignoredInARow: number; skip: number };
 function atomicJson(file: string, value: unknown) {
 	mkdirSync(dirname(file), { recursive: true });
 	const temporary = file + ".tmp-" + process.pid;
@@ -134,13 +103,13 @@ function atomicJson(file: string, value: unknown) {
 	} finally { rmSync(temporary, { force: true }); }
 }
 function loadState(): State {
-	let state: State = { enabled: true, seen: [], known: [], ignoredInARow: 0, skip: 0 };
-	if (existsSync(STATE_FILE)) state = { ...state, ...JSON.parse(readFileSync(STATE_FILE, "utf8")) };
-	state.known = readKnowledge(state.known);
-	return state;
+	const state: State = { enabled: true, seen: [], ignoredInARow: 0, skip: 0 };
+	if (!existsSync(STATE_FILE)) return state;
+	// Older versions also saved a "known" list from the removed Knew it button; it is no longer read.
+	const { known: _known, ...saved } = JSON.parse(readFileSync(STATE_FILE, "utf8"));
+	return { ...state, ...saved };
 }
 function saveState(s: State) {
-	s.known = readKnowledge(s.known);
 	atomicJson(STATE_FILE, s);
 }
 function log(entry: Record<string, unknown>) {
@@ -256,28 +225,21 @@ function linkEvidence(evidence: string, cwd: string) {
 	return `\x1b]8;;${pathToFileURL(file).href}\x1b\\${m[0]}\x1b]8;;\x1b\\${evidence.slice(m[0].length)}`;
 }
 
-type Act = "explain" | "knew" | "ask" | "dismiss" | "got_it" | "simpler_words" | "less_detail" | "more_detail" | "undo" | "more";
-const NOTE_BUTTONS: Button<Act>[] = [
-	{ label: "Explain", action: "explain" },
-	{ label: "Knew it", action: "knew" },
+type Act = "explain" | "ask" | "dismiss" | "undo" | "more";
+// On every note's line: the two answers most people use, one click each.
+const LINE_BUTTONS: Button<Act>[] = [
 	{ label: "Ask agent", action: "ask" },
-	{ label: "Dismiss", action: "dismiss", dim: true },
+	{ label: "\u00d7", action: "dismiss", dim: true },
 ];
+// Under an open note: Explain, then the same answers again below the explanation.
+const OPEN_BUTTONS: Button<Act>[] = [{ label: "Explain", action: "explain" }];
 const EXPLAINED_BUTTONS: Button<Act>[] = [
-	{ label: "Got it", action: "got_it" },
 	{ label: "Ask agent", action: "ask" },
-	{ label: "Simpler", action: "simpler_words" },
-	{ label: "Shorter", action: "less_detail" },
-	{ label: "More detail", action: "more_detail" },
 	{ label: "Dismiss", action: "dismiss", dim: true },
 ];
 // The keyboard explanation screen: the same choices, labelled with their keys.
 const EXPLAIN_SCREEN_BUTTONS: Button<string>[] = [
-	{ label: "1 Got it", action: "understood" },
 	{ label: "2 Ask agent", action: "chat" },
-	{ label: "s Simpler", action: "simpler_words" },
-	{ label: "l Shorter", action: "less_detail" },
-	{ label: "m More detail", action: "more_detail" },
 	{ label: "0 Dismiss", action: "dismiss", dim: true },
 ];
 
@@ -307,7 +269,7 @@ export default function (pi: ExtensionAPI) {
 	let expandedId: string | undefined;
 	type View = { text?: string; md?: Markdown; writing?: boolean; error?: string };
 	const views = new Map<string, View>();
-	let undo: { note: Note; index: number; action: "knew" | "dismiss"; timer: ReturnType<typeof setTimeout> } | undefined;
+	let undo: { note: Note; index: number; timer: ReturnType<typeof setTimeout> } | undefined;
 	const current = () => notes.find((n) => n.id === expandedId) ?? notes[0];
 	let answered = new Map<string, { note: Note; action: string }>();
 	let inFlight: AbortController | undefined;
@@ -321,11 +283,6 @@ export default function (pi: ExtensionAPI) {
 	let askedAtTurn = 0;
 	// The terminal widget shows one note; "N more waiting" opens the rest.
 	let showAll = false;
-	const remember = (line: string, known: boolean) => {
-		mkdirSync(dirname(KNOWLEDGE_FILE), { recursive: true });
-		appendFileSync(KNOWLEDGE_FILE, "\n" + JSON.stringify({ line, known }) + "\n");
-		state.known = readKnowledge(state.known);
-	};
 
 	// Same model and thinking reuse main's cache; explicit routes retain their provider.
 	const thinkingLevels = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
@@ -375,8 +332,9 @@ export default function (pi: ExtensionAPI) {
 
 	// The current note on one line, then "N more waiting" when others are queued; clicking that
 	// shows every note (no key hint line: alt+x dismisses, /ysk or alt+shift+y responds).
-	// In fullscreen mode, clicking a note opens it: evidence, explanation and a row of buttons.
-	type Row = { note?: Note; hits?: Hit<Act>[] };
+	// In fullscreen mode each note ends with [Ask agent] [×]; clicking its text opens it to show
+	// the evidence and an Explain button.
+	type Row = { note?: Note; hits?: Hit<Act>[]; opens?: boolean };
 	const notesWidget = (ctx: ExtensionContext, theme: Theme): Component => {
 		let rows: Row[] = [];
 		return {
@@ -394,7 +352,7 @@ export default function (pi: ExtensionAPI) {
 				if (undo) items.splice(showAll ? Math.min(undo.index, items.length) : items.length, 0, undefined);
 				for (const n of items) {
 					if (!n) {
-						const prefix = "  " + theme.fg("dim", `${undo!.action === "knew" ? "Marked as known" : "Dismissed"} \u00b7 `);
+						const prefix = "  " + theme.fg("dim", "Dismissed \u00b7 ");
 						const x0 = visibleWidth(prefix);
 						add([prefix + theme.fg("accent", "Undo")], { hits: [{ x0, x1: x0 + 4, action: "undo" }] });
 						continue;
@@ -403,7 +361,21 @@ export default function (pi: ExtensionAPI) {
 					const mark = on ? theme.fg("accent", "\u2726 ") : theme.fg("dim", "\u2727 ");
 					const tag = on ? theme.fg("accent", theme.bold(n.tag)) : theme.fg("dim", n.tag);
 					const from = n.from ? theme.fg("dim", ` (${n.from})`) : "";
-					add(wrapTextWithAnsi(mark + tag + from + theme.fg("dim", " \u00b7 ") + n.line, width), { note: n });
+					const text = mark + tag + from + theme.fg("dim", " \u00b7 ") + n.line;
+					const inline = layoutButtons(LINE_BUTTONS, width, 0, theme);
+					const buttonsWidth = visibleWidth(inline.lines[0]);
+					if (width - buttonsWidth - 2 >= MIN_NOTE_TEXT) {
+						// The buttons end the note's last line; the text wraps short enough to leave room.
+						const wrapped = wrapTextWithAnsi(text, width - buttonsWidth - 2);
+						const last = wrapped.pop()!;
+						add(wrapped, { note: n, opens: true });
+						const x = visibleWidth(last) + 2;
+						add([last + "  " + inline.lines[0]], { note: n, opens: true, hits: inline.hits[0].map((h) => ({ ...h, x0: h.x0 + x, x1: h.x1 + x })) });
+					} else {
+						add(wrapTextWithAnsi(text, width), { note: n, opens: true });
+						const laid = layoutButtons(LINE_BUTTONS, width, 2, theme);
+						laid.lines.forEach((l, i) => add([l], { note: n, hits: laid.hits[i] }));
+					}
 					if (n.id !== expandedId) continue;
 					if (n.evidence) add(wrapTextWithAnsi("  " + theme.fg("dim", "Evidence: ") + linkEvidence(n.evidence, ctx.cwd), width), {});
 					const v = views.get(n.id);
@@ -413,7 +385,7 @@ export default function (pi: ExtensionAPI) {
 						add(["  " + theme.fg("dim", "Writing\u2026")], {});
 						continue;
 					}
-					const laid = layoutButtons(v?.md ? EXPLAINED_BUTTONS : NOTE_BUTTONS, width, 2, theme);
+					const laid = layoutButtons(v?.md ? EXPLAINED_BUTTONS : OPEN_BUTTONS, width, 2, theme);
 					laid.lines.forEach((l, i) => add([l], { note: n, hits: laid.hits[i] }));
 				}
 				if (notes.length > 1) {
@@ -430,7 +402,7 @@ export default function (pi: ExtensionAPI) {
 					void act(ctx, action, row.note);
 					return { handled: true };
 				}
-				if (row.note && !row.hits && e.type === "click" && e.button === "left") {
+				if (row.note && row.opens && e.type === "click" && e.button === "left") {
 					toggle(ctx, row.note);
 					return { handled: true };
 				}
@@ -456,8 +428,8 @@ export default function (pi: ExtensionAPI) {
 		saveState(state);
 	};
 
-	/** Take a note off the list. Mouse answers that lose something (knew, dismiss) can be undone for a few seconds. */
-	function removeNote(ctx: ExtensionContext, n: Note, undoable?: "knew" | "dismiss") {
+	/** Take a note off the list. A mouse dismiss can be undone for a few seconds. */
+	function removeNote(ctx: ExtensionContext, n: Note, undoable = false) {
 		const index = notes.indexOf(n);
 		notes = notes.filter((x) => x !== n);
 		views.delete(n.id);
@@ -471,7 +443,7 @@ export default function (pi: ExtensionAPI) {
 				render(ctx);
 			}, UNDO_MS);
 			timer.unref?.();
-			undo = { note: n, index, action: undoable, timer };
+			undo = { note: n, index, timer };
 		}
 		engage();
 		render(ctx);
@@ -479,12 +451,11 @@ export default function (pi: ExtensionAPI) {
 
 	function restore(ctx: ExtensionContext) {
 		if (!undo) return;
-		const { note, index, action, timer } = undo;
+		const { note, index, timer } = undo;
 		clearTimeout(timer);
 		undo = undefined;
 		notes.splice(Math.min(index, notes.length), 0, note);
-		if (action === "knew") remember(note.line, false);
-		log({ event: "undo", answer: action, via: "mouse", line: note.line });
+		log({ event: "undo", answer: "dismiss", via: "mouse", line: note.line });
 		render(ctx);
 	}
 
@@ -518,8 +489,8 @@ export default function (pi: ExtensionAPI) {
 		render(ctx);
 	}
 
-	/** Explain a note under its line, or rewrite the explanation already there. */
-	async function writeInline(ctx: ExtensionContext, n: Note, direction: Direction) {
+	/** Explain a note under its line. */
+	async function writeInline(ctx: ExtensionContext, n: Note) {
 		const v: View = views.get(n.id) ?? {};
 		views.set(n.id, v);
 		if (v.writing) return;
@@ -527,7 +498,7 @@ export default function (pi: ExtensionAPI) {
 			v.text = text;
 			v.md = new Markdown(text, 2, 0, getMarkdownTheme());
 		};
-		if (direction === "first" && n.explanation) {
+		if (n.explanation) {
 			show(n.explanation);
 			render(ctx);
 			return;
@@ -536,8 +507,7 @@ export default function (pi: ExtensionAPI) {
 		v.error = undefined;
 		render(ctx);
 		try {
-			const prev = direction !== "first" && v.text ? { direction, text: v.text } : undefined;
-			const r = await fork(ctx, lastLlmMessages, explainPrompt(n.line, prev), new AbortController().signal);
+			const r = await fork(ctx, lastLlmMessages, explainPrompt(n.line), new AbortController().signal);
 			if (r.text) show(r.text);
 			else v.error = "No explanation came back.";
 		} catch (err) {
@@ -554,13 +524,11 @@ export default function (pi: ExtensionAPI) {
 			return render(ctx);
 		}
 		if (!n || !notes.includes(n)) return;
-		if (a === "explain") return writeInline(ctx, n, "first");
-		if (a === "simpler_words" || a === "less_detail" || a === "more_detail") return writeInline(ctx, n, a);
+		if (a === "explain") return writeInline(ctx, n);
 		const explanation = views.get(n.id)?.text;
-		removeNote(ctx, n, a === "knew" || a === "dismiss" ? a : undefined);
-		if (a === "knew") remember(n.line, true);
+		removeNote(ctx, n, a === "dismiss");
 		if (a === "ask") chatInMain(n, explanation ?? n.explanation);
-		const answer = { knew: "knew", dismiss: "dismiss", ask: "chat", got_it: "understood" }[a];
+		const answer = { dismiss: "dismiss", ask: "chat" }[a];
 		log({ event: "answer", answer, via: "mouse", explained: !!explanation, line: n.line, msToAnswer: Date.now() - n.shownAt });
 	}
 
@@ -825,7 +793,6 @@ export default function (pi: ExtensionAPI) {
 		inFlight = ac;
 		const askedAt = promptCounter;
 		const seen = [...state.seen];
-		const known = [...state.known];
 		// RPC clients show and answer notes themselves, so only the terminal settles notes.
 		const waiting = ctx.mode === "tui" ? waitingNotes() : [];
 		const queueFull = ctx.mode === "tui" && notes.length >= MAX_NOTES;
@@ -838,7 +805,7 @@ export default function (pi: ExtensionAPI) {
 			let outcome = "error";
 			let extra: CheckDetails = {};
 			try {
-				const { text, ...result } = await fork(ctx, lastLlmMessages, detectPrompt(seen, known, waiting, queueFull), ac.signal);
+				const { text, ...result } = await fork(ctx, lastLlmMessages, detectPrompt(seen, waiting, queueFull), ac.signal);
 				extra = { ...result, waiting: waiting.length };
 				if (ac.signal.aborted || result.stopReason === "aborted") outcome = "aborted";
 				else if (result.stopReason === "error") outcome = "error";
@@ -850,7 +817,7 @@ export default function (pi: ExtensionAPI) {
 					settle(ctx, settled, "check");
 					const p = parse(text);
 					if (p.kind !== "line") outcome = p.kind;
-					else if ([...seen, ...known, ...waiting.map((n) => n.line)].some((x) => norm(x) === norm(p.line))) outcome = "deduped";
+					else if ([...seen, ...waiting.map((n) => n.line)].some((x) => norm(x) === norm(p.line))) outcome = "deduped";
 					else if (ctx.mode === "tui" && !CHILD_INBOX && notes.length >= MAX_NOTES) {
 						// Not added to seen, so a later check can raise it once there is room.
 						outcome = "queue_full";
@@ -945,49 +912,27 @@ export default function (pi: ExtensionAPI) {
 			ctx.ui.notify("One moment\u2026", "info");
 			text = (await fork(ctx, lastLlmMessages, explainPrompt(n.line), new AbortController().signal)).text;
 		}
-		while (true) {
-			const choice = await ctx.ui.custom<string>((_tui, theme, _kb, done) => {
-				const c = new Container();
-				const border = new DynamicBorder((s: string) => theme.fg("accent", s));
-				c.addChild(border);
-				c.addChild(new Text(theme.fg("accent", `\u2726 ${n.tag}`), 1, 0));
-				c.addChild(new Markdown(text!, 1, 1, getMarkdownTheme()));
-				// Enter and Esc also work: Enter means Got it, Esc means Dismiss.
-				c.addChild(new ButtonRow(EXPLAIN_SCREEN_BUTTONS, theme, done));
-				c.addChild(border);
-				return {
-					render: (w: number) => c.render(w),
-					invalidate: () => c.invalidate(),
-					handleMouse: (e: TuiMouseEvent) => c.handleMouse(e),
-					handleInput: (d: string) => {
-						if (d === "1" || matchesKey(d, "enter")) done("understood");
-						else if (d === "2") done("chat");
-						else if (d === "s") done("simpler_words");
-						else if (d === "l") done("less_detail");
-						else if (d === "m") done("more_detail");
-						else if (d === "0" || matchesKey(d, "escape")) done("dismiss");
-					},
-				};
-			});
-			if (choice === "simpler_words" || choice === "less_detail" || choice === "more_detail") {
-				ctx.ui.notify("Rewriting\u2026", "info");
-				try {
-					const r = await fork(
-						ctx,
-						lastLlmMessages,
-						explainPrompt(n.line, { direction: choice, text: text! }),
-						new AbortController().signal,
-					);
-					if (r.text) text = r.text;
-				} catch (err) {
-					ctx.ui.notify(`Couldn\u2019t write that explanation: ${err}`, "error");
-				}
-				continue;
-			}
-			log({ event: "explained", answer: choice, line: n.line });
-			if (choice === "chat") chatInMain(n, text);
-			return;
-		}
+		const choice = await ctx.ui.custom<string>((_tui, theme, _kb, done) => {
+			const c = new Container();
+			const border = new DynamicBorder((s: string) => theme.fg("accent", s));
+			c.addChild(border);
+			c.addChild(new Text(theme.fg("accent", `\u2726 ${n.tag}`), 1, 0));
+			c.addChild(new Markdown(text!, 1, 1, getMarkdownTheme()));
+			// Enter and Esc also dismiss.
+			c.addChild(new ButtonRow(EXPLAIN_SCREEN_BUTTONS, theme, done));
+			c.addChild(border);
+			return {
+				render: (w: number) => c.render(w),
+				invalidate: () => c.invalidate(),
+				handleMouse: (e: TuiMouseEvent) => c.handleMouse(e),
+				handleInput: (d: string) => {
+					if (d === "2") done("chat");
+					else if (d === "0" || matchesKey(d, "enter") || matchesKey(d, "escape")) done("dismiss");
+				},
+			};
+		});
+		log({ event: "explained", answer: choice, line: n.line });
+		if (choice === "chat") chatInMain(n, text);
 	}
 
 	// CC's un(): quote the note into the main session.
@@ -1038,28 +983,27 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 		const n = current();
-		const options = ["1 Learn more", "2 Knew this already", "3 Chat in main session", "0 Dismiss"];
+		const options = ["1 Explain", "2 Ask agent", "0 Dismiss"];
 		const pick = await ctx.ui.select(`${n.tag} \u00b7 ${n.line}`, options);
 		if (!pick || !notes.includes(n)) return;
 		removeNote(ctx, n);
 		const k = pick[0];
-		log({ event: "answer", answer: { "1": "learn_more", "2": "knew", "3": "chat", "0": "dismiss" }[k], line: n.line, msToAnswer: Date.now() - n.shownAt });
+		log({ event: "answer", answer: { "1": "learn_more", "2": "chat", "0": "dismiss" }[k], line: n.line, msToAnswer: Date.now() - n.shownAt });
 		if (k === "1") await showExplanation(ctx, n).catch((err) => ctx.ui.notify(`Couldn\u2019t write that explanation: ${err}`, "error"));
-		else if (k === "2") remember(n.line, true);
-		else if (k === "3") chatInMain(n, n.explanation);
+		else if (k === "2") chatInMain(n, n.explanation);
 	}
 
 	// RPC clients answer notes in their own UI, then send `/ysk answer <id> <action>`
 	// (T3 Code's actions: knew, dismiss, learn, send). The client already showed the
 	// explanation or quoted the note to the agent, so this only records the answer.
-	const CLIENT_ANSWERS: Record<string, string> = { knew: "knew", dismiss: "dismiss", learn: "learn_more", send: "chat" };
+	// Nothing is remembered as known any more, so a client's "knew" is a dismiss.
+	const CLIENT_ANSWERS: Record<string, string> = { knew: "dismiss", dismiss: "dismiss", learn: "learn_more", send: "chat" };
 	function answerFromClient(ctx: ExtensionContext, rest: string) {
 		const [id, action] = rest.trim().split(/\s+/);
 		const answer = action && Object.hasOwn(CLIENT_ANSWERS, action) ? CLIENT_ANSWERS[action] : undefined;
 		const prior = answered.get(id);
 		const n = notes.find((x) => x.id === id) ?? prior?.note;
 		if (n && action === "undo") {
-			if (prior?.action === "knew") remember(n.line, false);
 			answered.delete(id);
 			if (!notes.some((x) => x.id === id)) notes.push(n);
 			saveState(state);
@@ -1074,7 +1018,6 @@ export default function (pi: ExtensionAPI) {
 		notes = notes.filter((x) => x !== n);
 		state.ignoredInARow = 0;
 		state.skip = 0;
-		if (answer === "knew") remember(n.line, true);
 		saveState(state);
 		render(ctx);
 		log({ event: "answer", answer, via: "client", line: n.line, msToAnswer: Date.now() - n.shownAt });

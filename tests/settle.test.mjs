@@ -74,6 +74,8 @@ function open(session) {
     close: () => handlers.get('session_shutdown')({}, ctx),
   };
 }
+// Every note line ends with its one-click answers.
+const B = '  [Ask agent]  [\u00d7]';
 const note = (line) => `learn: ${line}\ntag: Heads up\nevidence: none\nexplain: **${line}**`;
 const events = () => readFileSync(join(home, '.pi/agent/you-should-know/checks.jsonl'), 'utf8').trim().split('\n').map((l) => JSON.parse(l));
 
@@ -81,9 +83,9 @@ test('the terminal shows one note and a count of the rest', async () => {
   const s = open('one-at-a-time');
   s.replies.push(note('First thing.'), note('Second thing.'), note('Third thing.'));
   await s.turns(18);
-  assert.deepEqual(s.lines(), ['\u2726 Heads up \u00b7 First thing.', '  2 more waiting']);
+  assert.deepEqual(s.lines(), ['\u2726 Heads up \u00b7 First thing.' + B, '  2 more waiting']);
   await s.click(3, 1);
-  assert.deepEqual(s.lines(), ['\u2726 Heads up \u00b7 First thing.', '\u2727 Heads up \u00b7 Second thing.', '\u2727 Heads up \u00b7 Third thing.', '  Show one']);
+  assert.deepEqual(s.lines(), ['\u2726 Heads up \u00b7 First thing.' + B, '\u2727 Heads up \u00b7 Second thing.' + B, '\u2727 Heads up \u00b7 Third thing.' + B, '  Show one']);
   await s.click(3, 3);
   assert.equal(s.lines().length, 2);
   s.close();
@@ -97,7 +99,7 @@ test('a later check settles notes the agent has dealt with and says how long the
   s.replies.push('settled: #1\nlearn: none');
   await s.turns(6);
   assert.match(s.prompts.at(-1), /- #1 \(raised 12 steps ago\): The agent just read a broken lockfile\.\n- #2 \(raised 6 steps ago\): Tests were skipped\./);
-  assert.deepEqual(s.lines(), ['\u2726 Heads up \u00b7 Tests were skipped.']);
+  assert.deepEqual(s.lines(), ['\u2726 Heads up \u00b7 Tests were skipped.' + B]);
   assert.ok(events().some((e) => e.event === 'settled' && e.via === 'check' && e.line === 'The agent just read a broken lockfile.'));
   s.close();
 });
@@ -123,7 +125,7 @@ test('a full queue keeps its notes and holds new ones back for later', async () 
   await s.turns(30);
   s.replies.push('settled: none\n' + note('Note 6.'));
   await s.turns(6);
-  assert.deepEqual(s.lines(), ['\u2726 Heads up \u00b7 Note 1.', '  4 more waiting']);
+  assert.deepEqual(s.lines(), ['\u2726 Heads up \u00b7 Note 1.' + B, '  4 more waiting']);
   assert.ok(events().some((e) => e.outcome === 'queue_full' && e.line === 'Note 6.'));
   s.close();
 });

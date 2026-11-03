@@ -68,3 +68,31 @@ test('temporary Pi discovery sessions do not create artifacts in the working dir
     assert.equal(existsSync(join(home, 'artifacts/temporary-discovery')), false);
   } finally { process.chdir(cwd); }
 });
+
+test('each note ends with Ask agent and × buttons that answer it in one click', async () => {
+  const handlers = new Map();
+  const sent = [];
+  let command, widget;
+  extension({ on: (event, handler) => handlers.set(event, handler), registerCommand: (_, value) => { command = value.handler; }, registerShortcut() {}, sendUserMessage: (text) => sent.push(text) });
+  const ctx = {
+    mode: 'tui', hasUI: true, isIdle: () => true, cwd: home,
+    sessionManager: { getSessionDir: () => home, getSessionId: () => 'inline-buttons' },
+    ui: { notify() {}, setWidget: (_, factory) => { widget = factory?.(undefined, { fg: (_, s) => s, bold: (s) => s }); } },
+  };
+  handlers.get('session_start')({}, ctx);
+  const click = (text, label) => {
+    const lines = widget.render(100);
+    const y = lines.findIndex((line) => line.includes(text));
+    assert.ok(y >= 0, `no line contains ${text}:\n${lines.join('\n')}`);
+    widget.handleMouse({ type: 'click', button: 'left', x: lines[y].indexOf(label) + 1, y });
+  };
+  await command('test', ctx);
+  assert.match(widget.render(100)[0], /This is a test note from \/ysk test\. {2}\[Ask agent\] {2}\[×\]$/);
+  click('test note', '[Ask agent]');
+  assert.equal(sent.length, 1);
+  assert.match(sent[0], /This is a test note/);
+  await command('test', ctx);
+  click('test note', '[×]');
+  assert.deepEqual(widget.render(100), ['  Dismissed · Undo']);
+  handlers.get('session_shutdown')({}, ctx);
+});
